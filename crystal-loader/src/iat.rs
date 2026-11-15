@@ -13,7 +13,7 @@ pub struct ImportSlot {
     pub slot: *mut usize,
 }
 
-/// Reads a loaded module's import directory for `dll` (case-insensitive).
+/// Reads a loaded module's import directory for `dll` (case-insensitive; empty = every DLL).
 ///
 /// # Safety
 /// `base` must be a mapped module image.
@@ -45,7 +45,7 @@ pub unsafe fn import_slots(base: usize, dll: &str) -> Vec<ImportSlot> {
             break;
         }
         let this = CStr::from_ptr((base + name) as *const _).to_bytes();
-        if this.eq_ignore_ascii_case(dll.as_bytes()) {
+        if dll.is_empty() || this.eq_ignore_ascii_case(dll.as_bytes()) {
             let mut i = 0;
             loop {
                 let slot = (base + first + i * thunk) as *mut usize;

@@ -811,7 +811,7 @@ fn setup(view: &View, app: &App, state: &mut State) {
 fn row_ink(state: RowState) -> Ink {
     match state {
         RowState::Closing | RowState::Waiting | RowState::Updating | RowState::ViewerConfirm | RowState::ViewerUpdating
-            | RowState::Starting | RowState::SigningIn => Ink::Warn,
+            | RowState::Starting | RowState::SigningIn | RowState::Relaunching => Ink::Warn,
         RowState::Playing => Ink::Info,
         RowState::SignedIn => Ink::Ok,
         RowState::Private | RowState::Idle => Ink::Sub,
@@ -828,7 +828,7 @@ fn row_lamp(state: RowState) -> LampState {
         RowState::Starting | RowState::SigningIn | RowState::Updating | RowState::ViewerUpdating => LampState::Rising,
         RowState::NeedsCode | RowState::ViewerConfirm => LampState::Code,
         RowState::Problem => LampState::Error,
-        RowState::Closing | RowState::Waiting | RowState::Private | RowState::Idle => LampState::Off,
+        RowState::Closing | RowState::Waiting | RowState::Private | RowState::Relaunching | RowState::Idle => LampState::Off,
     }
 }
 

@@ -57,7 +57,7 @@ fn operand_matches(base: usize, code: &[u8], prefix: &[u8], rva: usize, suffix: 
 /// lobby, character table and menus all resolved, and whose code sites still
 /// hold the scanned instructions in live memory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Layout { base: usize, menus: Menus, lobby: usize }
+pub(crate) struct Layout { pub(crate) base: usize, menus: Menus, lobby: usize }
 
 impl Layout {
     pub(crate) fn resolve(resolution: &Resolution) -> Result<Self, String> {
@@ -120,8 +120,14 @@ fn verified_input_layout(base: usize, keys: &Input) -> bool {
         && at(keys.pressed).and_then(read::<[u8; 28]>) == Some(KEY_PRESSED)
 }
 
+/// The client's one-button notice: lobby refusals (such as "still logged in")
+/// and the in-world disconnect (disconnect.rs). Read live as these 16 bytes.
+pub(crate) const OK_MENU: &[u8; 16] = b"menu    ok      ";
+
+/// `Other` is a readable menu this module does not know; an unreadable focus
+/// is no snapshot at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Screen { Warning, Title, Characters, Confirm, Other }
+enum Screen { Warning, Title, Characters, Confirm, Dialog, Other }
 
 fn screen(name: &[u8; 16]) -> Screen {
     match name {
@@ -129,6 +135,7 @@ fn screen(name: &[u8; 16]) -> Screen {
         b"menu    loby2win" => Screen::Title,
         b"menu    dbnamese" => Screen::Characters,
         b"menu    ptc6yesn" => Screen::Confirm,
+        OK_MENU => Screen::Dialog,
         _ => Screen::Other,
     }
 }
@@ -141,9 +148,12 @@ impl Screen {
             Self::Title => "title",
             Self::Characters => "characters",
             Self::Confirm => "confirmation",
-            Self::Other => "other",
+            Self::Dialog | Self::Other => "other",
         }
     }
+
+    /// One of the login menus the navigator drives.
+    fn login(self) -> bool { !matches!(self, Self::Dialog | Self::Other) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,14 +169,14 @@ struct Snapshot {
 }
 
 /// The focused menu, its resource and its resource name.
-fn focused_menu(layout: &Layout) -> Option<(usize, usize, [u8; 16])> {
+pub(crate) fn focused_menu(layout: &Layout) -> Option<(usize, usize, [u8; 16])> {
     let focus = pointer(layout.base + layout.menus.focus)?;
     let resource = pointer(focus + MENU_RESOURCE)?;
     Some((focus, resource, read::<[u8; 16]>(resource + MENU_NAME)?))
 }
 
 /// The same menu is still focused: no switch happened during a read.
-fn menu_unchanged(layout: &Layout, focus: usize, resource: usize, name: &[u8; 16]) -> bool {
+pub(crate) fn menu_unchanged(layout: &Layout, focus: usize, resource: usize, name: &[u8; 16]) -> bool {
     pointer(layout.base + layout.menus.focus) == Some(focus) && read::<[u8; 16]>(resource + MENU_NAME).as_ref() == Some(name)
 }
 
@@ -179,10 +189,12 @@ fn snapshot(layout: &Layout, target: u8) -> Option<Snapshot> {
         Screen::Title => m.title,
         Screen::Characters => m.characters,
         Screen::Confirm => m.confirm,
-        Screen::Other => 0,
+        Screen::Dialog | Screen::Other => 0,
     };
     let mut state = Snapshot { screen, focus, cursor: -1, character_count: 0,
         target_available: false, login_context: false, selected: -1, login_confirmation: false };
+    // A disabled dialog takes no input (as disconnect.rs requires of it).
+    if screen == Screen::Dialog && read::<u8>(focus + MENU_DISABLED)? != 0 { return None; }
     if controller_rva != 0 {
         let controller = pointer(base + controller_rva)?;
         // The focused menu must be this controller's live UI, not a background
@@ -218,13 +230,15 @@ fn snapshot(layout: &Layout, target: u8) -> Option<Snapshot> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Key { Enter, Up, Down }
+pub(crate) enum Key { Enter, Up, Down }
 impl Key {
     fn scan(self) -> u32 { match self { Self::Enter => 0x1C, Self::Up => 0xC8, Self::Down => 0xD0 } }
 }
 
+/// `Refused` and `Rearm` report a still-logged-in refusal read and its dialog
+/// closed, once each; neither sends anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Action { Wait, Tap(Key), Finished, Stop(&'static str) }
+enum Action { Wait, Tap(Key), Finished, Stop(&'static str), Refused, Rearm }
 
 #[derive(Clone, Copy, Debug)]
 struct Pending { before: Snapshot, key: Key, sent: Duration }
@@ -245,7 +259,7 @@ impl Navigator {
         if let Some(pending) = self.pending {
             // Enter on the license warning or the title connects to the lobby first; the
             // game focuses an unrecognised menu until the next login screen appears.
-            let in_transit = state.screen == Screen::Other && pending.key == Key::Enter
+            let in_transit = !state.screen.login() && pending.key == Key::Enter
                 && matches!(pending.before.screen, Screen::Warning | Screen::Title);
             if in_transit {
                 return if now.saturating_sub(pending.sent) > Duration::from_secs(60) {
@@ -277,7 +291,7 @@ impl Navigator {
             // A retained POL host can show an initialization menu before the
             // new game's title screen. Wait for a recognized login menu before
             // sending any input; a later unexpected transition still stops us.
-            Screen::Other if self.taps == 0 => Action::Wait,
+            Screen::Dialog | Screen::Other if self.taps == 0 => Action::Wait,
             Screen::Warning | Screen::Title if !self.selected => {
                 if state.cursor == 0 { Action::Tap(Key::Enter) }
                 else { Action::Stop("login menu selection was changed; finish login manually") }
@@ -315,7 +329,211 @@ impl Navigator {
     }
 }
 
-fn game_window(layout: &Layout) -> Option<(HWND, u32)> {
+/// The lobby's answer to the character selection, as GetLobbyError (100ef920)
+/// reads it: a nonzero tcp protocol error wins over the lobby error field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reply { Unknown, Pending, StillLoggedIn, Failed(i32) }
+
+/// Raw codes the client shows as 3000 + code. The client's own error table
+/// (table 7, dialog disposal) maps 3201 and 3307 to the same "Same character is
+/// already logged in" message. 201 arrives as the tcp protocol error (observed
+/// live after a disconnect); 307 is the lobby server's variant of that message.
+const STILL_LOGGED_IN: [i32; 2] = [201, 307];
+
+fn reply(lobby: Option<crate::lobby::Snapshot>) -> Reply {
+    let Some(lobby) = lobby else { return Reply::Unknown; };
+    // tcp_process ends a failed request with the operation idle and the reply -1.
+    if lobby.operation != 0 || lobby.reply_state != -1 { return Reply::Pending; }
+    let code = if lobby.protocol_error != 0 { lobby.protocol_error } else { lobby.lobby_error };
+    if STILL_LOGGED_IN.contains(&code) { Reply::StillLoggedIn } else { Reply::Failed(code) }
+}
+
+/// The server keeps a dropped session for a few minutes (one seen live
+/// released after ~30 s). Retries stop at this window or count.
+const RELEASE_WINDOW: Duration = Duration::from_secs(300);
+const MAX_RETRIES: u32 = 40;
+/// After a confirmation, how long to watch for the selection's answer.
+const WATCH: Duration = Duration::from_secs(60);
+/// The dialog must hold focus, unchanged, this long before Enter: the wait
+/// disconnect.rs gives the same menu before its OK.
+const DIALOG_SETTLE: Duration = Duration::from_secs(1);
+/// A dialog still in focus this long after Enter gets another, PRESSES at most.
+const REPRESS: Duration = Duration::from_secs(2);
+const PRESSES: u8 = 3;
+/// A refusal must bring its dialog into focus, and a dialog that took Enter
+/// must give way to a login menu, within this.
+const DIALOG_FOCUS: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// A confirmed selection's answer is outstanding.
+    Watch,
+    /// The selection was refused. `since`: when the refusal was read, or when
+    /// Enter last went to its dialog. `presses`: Enters sent to it.
+    Refused { since: Duration, presses: u8 },
+    /// The dialog closed; the navigator is logging the slot in again.
+    Login,
+}
+
+/// After a confirmed character login: answers each "still logged in" dialog
+/// and re-arms the ordinary navigator, which logs the same slot in again.
+struct Retry {
+    phase: Phase,
+    /// The last confirmation.
+    since: Duration,
+    /// The first refusal.
+    first: Option<Duration>,
+    /// Refusals answered with Enter.
+    retries: u32,
+    /// The game keeps an ended request's reply until its next lobby request,
+    /// so a failure in memory is old news until a reply without one is read.
+    stale: bool,
+}
+
+impl Retry {
+    fn new(now: Duration) -> Self { Self { phase: Phase::Watch, since: now, first: None, retries: 0, stale: true } }
+
+    /// The worker keeps running until this time since its start.
+    fn limit(&self) -> Duration { self.first.map_or(self.since + WATCH, |first| first + RELEASE_WINDOW) }
+
+    /// The navigator confirmed the character again.
+    fn confirmed(&mut self, now: Duration) { self.phase = Phase::Watch; self.since = now; }
+
+    /// Every poll's reply, whatever the menu: a request can start and end
+    /// while no menu is settled.
+    fn observe(&mut self, reply: Reply) { if reply == Reply::Pending { self.stale = false; } }
+
+    /// Whether this reply is the retry's to handle rather than the navigator's.
+    fn owns(&self, reply: Reply) -> bool {
+        self.phase != Phase::Login || (reply == Reply::StillLoggedIn && !self.stale)
+    }
+
+    /// `held`: how long `menu` has been in focus, unchanged.
+    fn action(&mut self, reply: Reply, menu: Snapshot, held: Duration, now: Duration) -> Action {
+        const OTHER_ERROR: &str = "character login failed with another lobby error; finish login manually";
+        let Phase::Refused { since, presses } = self.phase else {
+            return match reply {
+                Reply::Unknown | Reply::Pending => Action::Wait,
+                _ if self.stale => Action::Wait,
+                Reply::Failed(_) => Action::Stop(OTHER_ERROR),
+                Reply::StillLoggedIn => {
+                    let first = *self.first.get_or_insert(now);
+                    if self.retries >= MAX_RETRIES || now.saturating_sub(first) >= RELEASE_WINDOW {
+                        return Action::Stop("character is still logged in after the retry window; finish login manually");
+                    }
+                    self.phase = Phase::Refused { since: now, presses: 0 };
+                    Action::Refused
+                }
+            };
+        };
+        // After our Enter the dialog closed once a login menu has focus (its
+        // reply stays in memory until the next request), or a new request is out.
+        if presses > 0 && (menu.screen.login() || reply == Reply::Pending) {
+            self.phase = Phase::Login;
+            return Action::Rearm;
+        }
+        match reply {
+            Reply::Unknown => return Action::Wait,
+            Reply::Failed(_) => return Action::Stop(OTHER_ERROR),
+            Reply::Pending => return Action::Stop("still-logged-in dialog was closed by other input; finish login manually"),
+            Reply::StillLoggedIn => {}
+        }
+        let waited = now.saturating_sub(since);
+        match menu.screen {
+            Screen::Dialog if held < DIALOG_SETTLE || (presses > 0 && waited < REPRESS) => Action::Wait,
+            Screen::Dialog if presses >= PRESSES =>
+                Action::Stop("still-logged-in dialog stayed open after Enter; finish login manually"),
+            Screen::Dialog => Action::Tap(Key::Enter),
+            _ if waited > DIALOG_FOCUS =>
+                Action::Stop("no still-logged-in dialog or login menu in focus; finish login manually"),
+            _ => Action::Wait,
+        }
+    }
+
+    /// The game took Enter on the dialog. Returns which press of it this was.
+    fn sent(&mut self, now: Duration) -> u8 {
+        // Answered: what stays in memory is no longer news.
+        self.stale = true;
+        let Phase::Refused { since, presses } = &mut self.phase else { return 0; };
+        (*since, *presses) = (now, *presses + 1);
+        if *presses == 1 { self.retries += 1; }
+        *presses
+    }
+}
+
+/// What a key the game took was, for the log. `Dismiss`: which refusal, which
+/// Enter on its dialog, and how long after the first refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent { Key, Dismiss { retry: u32, press: u8, after: Duration }, Confirmed { again: bool }, Finished }
+
+/// Every login decision, made from what each poll read. It reads and sends
+/// nothing itself, so a recorded run replays through it exactly.
+struct Login {
+    slot: u8,
+    /// The lobby reply fields are checked by the diagnostics group; without
+    /// it a still-logged-in reply is left to the user.
+    replies: bool,
+    navigator: Navigator,
+    retry: Option<Retry>,
+    /// The focused menu, and since when it has read the same.
+    menu: Option<Snapshot>,
+    since: Duration,
+}
+
+impl Login {
+    fn new(slot: u8) -> Self {
+        Self { slot, replies: false, navigator: Navigator::new(slot), retry: None, menu: None, since: Duration::ZERO }
+    }
+
+    /// One poll. `menu`: the focused menu, or None while it is unreadable or
+    /// the window or held keys rule input out. Returns the menu once it has
+    /// settled, and what to do on it.
+    fn poll(&mut self, menu: Option<Snapshot>, answer: Reply, now: Duration) -> Option<(Snapshot, Action)> {
+        if let Some(retry) = &mut self.retry { retry.observe(answer); }
+        if menu != self.menu { (self.menu, self.since) = (menu, now); return None; }
+        let held = now.saturating_sub(self.since);
+        let menu = menu.filter(|_| held >= SETTLE)?;
+        let action = match &mut self.retry {
+            Some(retry) if retry.owns(answer) => retry.action(answer, menu, held, now),
+            _ => self.navigator.action(menu, now),
+        };
+        // The dialog closed: log the same slot in again from whichever login
+        // menu the game shows next.
+        if action == Action::Rearm { self.navigator = Navigator::new(self.slot); }
+        Some((menu, action))
+    }
+
+    /// A key was queued: the menu settles again before the next decision.
+    fn unsettle(&mut self) { self.menu = None; }
+
+    /// The game took `key` on `menu`.
+    fn sent(&mut self, menu: Snapshot, key: Key, now: Duration) -> Sent {
+        // Only the retry sends a key to the dialog.
+        if let (Screen::Dialog, Some(retry)) = (menu.screen, &mut self.retry) {
+            let press = retry.sent(now);
+            return Sent::Dismiss { retry: retry.retries, press, after: now.saturating_sub(retry.first.unwrap_or(now)) };
+        }
+        self.navigator.sent(menu, key, now);
+        if !self.navigator.confirmed { return Sent::Key; }
+        match &mut self.retry {
+            Some(retry) => { retry.confirmed(now); Sent::Confirmed { again: true } }
+            None if self.replies => { self.retry = Some(Retry::new(now)); Sent::Confirmed { again: false } }
+            None => Sent::Finished,
+        }
+    }
+}
+
+/// A menu resource name for the log (fixed game resource names).
+fn printable(name: &[u8; 16]) -> String {
+    name.iter().map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' }).collect()
+}
+
+/// The focused menu's resource name for the log.
+pub(crate) fn menu_name(layout: &Layout) -> String {
+    focused_menu(layout).map_or_else(|| "unreadable".into(), |(_, _, name)| printable(&name))
+}
+
+pub(crate) fn game_window(layout: &Layout) -> Option<(HWND, u32)> {
     // GameMain may create its UI on a different thread from GameStart. Read its
     // actual HWND (also passed to DestroyWindow at 10015a57), then validate it.
     let window = read::<u32>(layout.base + layout.menus.window)? as usize as HWND;
@@ -345,14 +563,14 @@ pub(crate) fn owned_window(window: HWND, game_thread: u32) -> bool {
     }
 }
 
-fn usable(window: HWND, game_thread: u32) -> bool {
+pub(crate) fn usable(window: HWND, game_thread: u32) -> bool {
     owned_window(window, game_thread) && unsafe {
         IsWindowVisible(window) != 0
             && IsWindowEnabled(window) != 0 && IsIconic(window) == 0
     }
 }
 
-fn keys_down() -> bool {
+pub(crate) fn keys_down() -> bool {
     // Never combine an automated key with held modifiers, manual navigation,
     // confirmation, Escape or mouse buttons. It can resume once they are up.
     [1, 2, 0x0D, 0x10, 0x11, 0x12, 0x1B, 0x25, 0x26, 0x27, 0x28, 0x5B, 0x5C]
@@ -360,7 +578,7 @@ fn keys_down() -> bool {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Tap { Sent, Skipped, Cancelled, Failed }
+pub(crate) enum Tap { Sent, Skipped, Cancelled, Failed }
 
 /// The GameStart this host is running, numbered from 1. A key belongs to one
 /// generation; 0 means no login worker is active and nothing may be sent.
@@ -473,6 +691,25 @@ unsafe fn dispatch_key(context: usize, key: Key, handlers: [KeyHandler; 3]) {
     for handler in handlers { handler(context, key.scan()); }
 }
 
+/// One key through the client's own three key-down handlers on its input
+/// bank. Only from the hooked keyboard frame on the game thread, after the
+/// caller's live checks.
+pub(crate) fn send(base: usize, keys: &Input, key: Key) -> bool {
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        // Only addresses the scan resolved (and a known build's table
+        // confirmed), re-checked byte for byte before the hook was installed.
+        type Setter = unsafe extern "thiscall" fn(usize, u32);
+        dispatch_key(base + keys.input, key,
+            [std::mem::transmute::<usize, Setter>(base + keys.pressed),
+             std::mem::transmute::<usize, Setter>(base + keys.edge),
+             std::mem::transmute::<usize, Setter>(base + keys.repeat)]);
+        true
+    }
+    #[cfg(not(target_arch = "x86"))]
+    { let _ = (base, keys, key); false }
+}
+
 unsafe extern "system" fn keyboard_state(data: *mut u8) -> i32 {
     let original = ORIGINAL_KEYBOARD.load(Ordering::Acquire);
     let original: unsafe extern "system" fn(*mut u8) -> i32 =
@@ -480,24 +717,10 @@ unsafe extern "system" fn keyboard_state(data: *mut u8) -> i32 {
     let result = original(data);
     crate::controller_settings::on_input(data);
     crate::game_shutdown::on_input(data);
+    crate::disconnect::on_input(data);
     let mut pending = command();
     let Some(input) = pending.as_ref() else { return result; };
-    let outcome = deliver(input, data, |context, key| {
-        #[cfg(target_arch = "x86")]
-        unsafe {
-            // Only addresses the scan resolved (and a known build's table
-            // confirmed), re-checked byte for byte before the hook was installed.
-            type Setter = unsafe extern "thiscall" fn(usize, u32);
-            let base = input.layout.base;
-            dispatch_key(context, key,
-                [std::mem::transmute::<usize, Setter>(base + input.keys.pressed),
-                 std::mem::transmute::<usize, Setter>(base + input.keys.edge),
-                 std::mem::transmute::<usize, Setter>(base + input.keys.repeat)]);
-            true
-        }
-        #[cfg(not(target_arch = "x86"))]
-        { let _ = (context, key); false }
-    });
+    let outcome = deliver(input, data, |_, key| send(input.layout.base, &input.keys, key));
     if let Some(outcome) = outcome {
         let input = pending.take().unwrap();
         let _ = input.result.send(outcome);
@@ -525,6 +748,9 @@ fn deliver(input: &Command, data: *mut u8, dispatch: impl FnOnce(usize, Key) -> 
     } else if game_window(&input.layout) != Some((window, input.game_thread))
         || !usable(window, input.game_thread)
         || snapshot(&input.layout, input.target) != Some(input.expected)
+        // The dialog gets Enter only while the lobby still reports its refusal.
+        || (input.expected.screen == Screen::Dialog
+            && reply(crate::lobby::snapshot(base, input.layout.lobby)) != Reply::StillLoggedIn)
         || (unsafe { GetForegroundWindow() } == window && keys_down())
         || read::<[u8; 256]>(base + input.keys.input).is_none_or(|keys| keys.iter().any(|key| key & 7 != 0)) {
         Tap::Skipped
@@ -667,6 +893,14 @@ fn prepare(resolution: &Resolution) -> Result<(Layout, Input, World, KeyboardHoo
     Ok((layout, keys, world, hook))
 }
 
+/// Tests that touch the process-wide input state (generation, queued command,
+/// keyboard hook) take this so they run one at a time, as games do.
+#[cfg(test)]
+pub(crate) fn input_globals() -> std::sync::MutexGuard<'static, ()> {
+    static GLOBALS: Mutex<()> = Mutex::new(());
+    GLOBALS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Starts this GameStart's generation: every key queued by an earlier game is
 /// discarded and can never be consumed by this one.
 fn begin_generation() -> u64 {
@@ -701,11 +935,10 @@ impl Worker {
             let _ended = Ended(generation);
             let started = Instant::now();
             let mut prepared = None;
-            let mut stable = None;
-            let mut changed = Instant::now();
-            let mut navigator = Navigator::new(config.character_slot);
+            let mut login = Login::new(config.character_slot);
+            let target = login.navigator.target;
             log!("auto-login: gen={generation} waiting for this game's login screen (slot {}; background input enabled)", config.character_slot);
-            while started.elapsed() < LIMIT {
+            while started.elapsed() < login.retry.as_ref().map_or(LIMIT, Retry::limit) {
                 if receiver.recv_timeout(POLL) != Err(mpsc::RecvTimeoutError::Timeout) { return; }
                 if crate::events::pipe_closed() { return; }
                 if ACTIVE.load(Ordering::Acquire) != generation { log!("auto-login: gen={generation} input stopped"); return; }
@@ -716,6 +949,10 @@ impl Worker {
                         Ok(ready) => {
                             log!("auto-login: gen={generation} FFXiMain at {:#x}; world flag at start: {:?}",
                                 resolution.base, ready.2.entered(resolution.base));
+                            login.replies = match &resolution.diagnostics {
+                                Ok(_) => true,
+                                Err(reason) => { log!("auto-login: gen={generation} still-logged-in retry unavailable ({reason})"); false }
+                            };
                             prepared = Some(ready);
                         }
                         Err(reason) => { log!("auto-login: gen={generation} unsupported game layout ({reason}); finish login manually"); return; }
@@ -726,46 +963,60 @@ impl Worker {
                 // A host that kept FFXiMain loaded from an earlier game may
                 // carry the flag over: checked before every poll.
                 if let Err(reason) = world_clear(world.entered(layout.base)) {
-                    log!("auto-login: gen={generation} {reason}; login input stopped for this game");
+                    match &login.retry {
+                        Some(retry) => log!("auto-login: gen={generation} {reason} after {} still-logged-in retries; input finished", retry.retries),
+                        None => log!("auto-login: gen={generation} {reason}; login input stopped for this game"),
+                    }
                     return;
                 }
-                let Some((window, game_thread)) = game_window(&layout) else { stable = None; continue; };
-                if !usable(window, game_thread) || (unsafe { GetForegroundWindow() } == window && keys_down()) { stable = None; continue; }
-                let current = snapshot(&layout, navigator.target);
-                if current != stable { stable = current; changed = Instant::now(); continue; }
-                if changed.elapsed() < SETTLE { continue; }
-                let Some(current) = current else { continue; };
-                match navigator.action(current, started.elapsed()) {
+                let now = started.elapsed();
+                // Read on every poll: the reply moves while no menu is settled.
+                let lobby = login.retry.as_ref().and_then(|_| crate::lobby::snapshot(layout.base, layout.lobby));
+                // No menu counts while the window cannot take input or the user holds a key.
+                let window = game_window(&layout).filter(|&(window, game_thread)| usable(window, game_thread)
+                    && !(unsafe { GetForegroundWindow() } == window && keys_down()));
+                let menu = window.and_then(|_| snapshot(&layout, target));
+                let (Some((window, game_thread)), Some((current, action))) = (window, login.poll(menu, reply(lobby), now)) else { continue; };
+                match action {
                     Action::Wait => {},
                     Action::Finished => { log!("auto-login: gen={generation} character login confirmed; input finished"); return; }
                     Action::Stop(reason) => {
-                        log!("auto-login: gen={generation} {reason} (screen={:?}, cursor={}, slot={}, count={})",
-                            current.screen, current.cursor, config.character_slot, current.character_count);
+                        log!("auto-login: gen={generation} {reason} (screen={:?}, menu={}, cursor={}, slot={}, count={}, lobby={lobby:?})",
+                            current.screen, menu_name(&layout), current.cursor, config.character_slot, current.character_count);
                         return;
                     }
+                    Action::Refused => log!("auto-login: gen={generation} character still logged in; Enter follows once its dialog has held focus for {}s (screen={:?}, menu={}, lobby={lobby:?})",
+                        DIALOG_SETTLE.as_secs(), current.screen, menu_name(&layout)),
+                    Action::Rearm => log!("auto-login: gen={generation} still-logged-in dialog closed; logging in again (menu={})", menu_name(&layout)),
                     Action::Tap(key) => {
-                        let outcome = tap(window, game_thread, layout, keys, navigator.target, current, key, generation, world, &receiver);
+                        let outcome = tap(window, game_thread, layout, keys, target, current, key, generation, world, &receiver);
                         if outcome != Tap::Skipped {
                             log!("auto-login: gen={generation} {:?} key={key:?} cursor={} result={outcome:?}",
                                 current.screen, current.cursor);
                         }
                         match outcome {
-                            Tap::Sent => {
-                                navigator.sent(current, key, started.elapsed());
-                                if navigator.confirmed {
-                                    log!("auto-login: gen={generation} login confirmation submitted; input finished");
-                                    return;
-                                }
+                            Tap::Sent => match login.sent(current, key, started.elapsed()) {
+                                Sent::Key => {}
+                                // The menu is certain: the game thread re-read it before taking the key.
+                                Sent::Dismiss { retry, press, after } => log!("auto-login: gen={generation} character still logged in; retry {retry}/{MAX_RETRIES}: Enter {press}/{PRESSES} on menu={} {:.1}s after the first refusal",
+                                    printable(OK_MENU), after.as_secs_f32()),
+                                Sent::Confirmed { again: false } => log!("auto-login: gen={generation} login confirmation submitted; watching for a still-logged-in reply"),
+                                Sent::Confirmed { again: true } => log!("auto-login: gen={generation} login confirmation submitted again; watching the lobby reply"),
+                                Sent::Finished => { log!("auto-login: gen={generation} login confirmation submitted; input finished"); return; }
                             },
                             Tap::Skipped => {},
                             Tap::Cancelled => return,
                             Tap::Failed => { log!("auto-login: gen={generation} game did not consume login input; finish login manually"); return; }
                         }
-                        stable = None;
+                        login.unsettle();
                     }
                 }
             }
-            log!("auto-login: gen={generation} timed out; finish login manually");
+            match &login.retry {
+                None => log!("auto-login: gen={generation} timed out; finish login manually"),
+                Some(Retry { first: None, .. }) => log!("auto-login: gen={generation} no still-logged-in reply; input finished"),
+                Some(retry) => log!("auto-login: gen={generation} retry window ended after {} still-logged-in retries; finish login manually", retry.retries),
+            }
             drop(prepared);
         });
         match worker {
@@ -832,6 +1083,15 @@ mod tests {
         fn menu(&mut self, name: &[u8; 16], cursor: i16) {
             self.0[0x2046..0x2056].copy_from_slice(name);
             self.0[0x104C..0x104E].copy_from_slice(&cursor.to_le_bytes());
+        }
+        /// The lobby reply, where the real reader looks for it.
+        fn lobby(&mut self, operation: u32, reply_state: i32, protocol_error: i32) {
+            use crate::lobby::{CONTEXT_PROTOCOL_ERROR, LOBBY_REPLY, LOBBY_TCP, TCP_CONTEXT, TCP_OPERATION};
+            self.ptr(0x20000 + LOBBY_TCP, 0x40000);
+            self.ptr(0x40000 + TCP_CONTEXT, 0x90000);
+            self.u32(0x40000 + TCP_OPERATION, operation);
+            self.u32(0x20000 + LOBBY_REPLY, reply_state as u32);
+            self.u32(0x90000 + CONTEXT_PROTOCOL_ERROR, protocol_error as u32);
         }
         fn snapshot(&self) -> Option<Snapshot> { snapshot(&self.layout(), 1) }
     }
@@ -1000,6 +1260,7 @@ mod tests {
 
     #[test]
     fn cancellation_before_queuing_does_not_leave_input() {
+        let _one = generations();
         let (send, receive) = mpsc::channel();
         send.send(()).unwrap();
         let layout = Layout { base: 0, menus: OLD.menus, lobby: LOBBY_PTR_RVA };
@@ -1012,8 +1273,7 @@ mod tests {
 
     /// GENERATION/ACTIVE/COMMAND are process-wide, as in the real host; the
     /// tests that drive them run one at a time.
-    static GENERATIONS: Mutex<()> = Mutex::new(());
-    fn generations() -> std::sync::MutexGuard<'static, ()> { GENERATIONS.lock().unwrap_or_else(|e| e.into_inner()) }
+    fn generations() -> std::sync::MutexGuard<'static, ()> { super::input_globals() }
 
     /// A Command for the fixture's dbnamese screen, as the worker would queue it.
     fn queued(fixture: &Fixture, generation: u64, key: Key) -> (Command, mpsc::Receiver<Tap>) {
@@ -1098,13 +1358,17 @@ mod tests {
         for name in [b"menu    mogmenu0", b"menu    jobchang", b"menu    ptc6yes0", b"menu    loby2wi ", b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"] {
             assert_eq!(screen(name), Screen::Other);
         }
+        // The navigator never answers a dialog: it is one more unknown screen to it.
+        assert_eq!(screen(OK_MENU), Screen::Dialog);
+        for other in [state(Screen::Other, 2), bare(Screen::Dialog, 0x900)] {
+            // Before any input: wait, never send.
+            assert_eq!(Navigator::new(1).action(other, Duration::ZERO), Action::Wait);
+            // After the character is chosen, an unknown screen stops for good.
+            let mut nav = Navigator::new(1);
+            nav.sent(state(Screen::Characters, 0), Key::Enter, Duration::ZERO);
+            assert!(matches!(nav.action(other, Duration::from_secs(1)), Action::Stop(_)));
+        }
         let other = state(Screen::Other, 2);
-        // Before any input: wait, never send.
-        assert_eq!(Navigator::new(1).action(other, Duration::ZERO), Action::Wait);
-        // After the character is chosen, an unknown screen stops for good.
-        let mut nav = Navigator::new(1);
-        nav.sent(state(Screen::Characters, 0), Key::Enter, Duration::ZERO);
-        assert!(matches!(nav.action(other, Duration::from_secs(1)), Action::Stop(_)));
         // After the confirmation, anything is the end of login.
         let mut nav = Navigator::new(1);
         nav.sent(state(Screen::Characters, 0), Key::Enter, Duration::ZERO);
@@ -1143,8 +1407,385 @@ mod tests {
         assert!(nav.confirmed);
     }
 
+    #[cfg(target_pointer_width = "32")]
+    fn lobby(operation: u32, reply_state: i32, lobby_error: i32, protocol_error: i32) -> Option<crate::lobby::Snapshot> {
+        // Built through the real reader's layout: only the decision fields matter.
+        let mut lobby = vec![0u8; 0x13700];
+        let mut tcp = vec![0u8; 0x4F200];
+        let mut context = vec![0u8; 0x140];
+        let put = |bytes: &mut Vec<u8>, at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        put(&mut tcp, crate::lobby::TCP_OPERATION, operation);
+        put(&mut tcp, crate::lobby::TCP_CONTEXT, context.as_mut_ptr() as usize as u32);
+        put(&mut context, crate::lobby::CONTEXT_PROTOCOL_ERROR, protocol_error as u32);
+        put(&mut lobby, crate::lobby::LOBBY_TCP, tcp.as_ptr() as usize as u32);
+        put(&mut lobby, crate::lobby::LOBBY_REPLY, reply_state as u32);
+        put(&mut lobby, crate::lobby::LOBBY_ERROR, lobby_error as u32);
+        let root = lobby.as_ptr() as usize as u32;
+        let base = (&root as *const u32 as usize).checked_sub(LOBBY_PTR_RVA).unwrap();
+        crate::lobby::snapshot(base, LOBBY_PTR_RVA)
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "32")]
+    fn lobby_reply_follows_the_games_error_getter() {
+        // Live: op=0 reply_state=-1 lobby_error=0 protocol_error=201 after a disconnect.
+        assert_eq!(reply(lobby(0, -1, 0, 201)), Reply::StillLoggedIn);
+        assert_eq!(reply(lobby(0, -1, 307, 0)), Reply::StillLoggedIn);
+        assert_eq!(reply(lobby(0, -1, 201, 100)), Reply::Failed(100), "the protocol error wins, as in 100ef920");
+        assert_eq!(reply(lobby(0, -1, 313, 0)), Reply::Failed(313));
+        assert_eq!(reply(lobby(5, 1, 0, 0)), Reply::Pending, "character selection outstanding");
+        assert_eq!(reply(lobby(5, -1, 0, 201)), Reply::Pending, "the request has not ended yet");
+        assert_eq!(reply(lobby(0, 0, 0, 0)), Reply::Pending);
+        assert_eq!(reply(None), Reply::Unknown);
+    }
+
+    /// A menu without a controller, as the real reader returns it.
+    fn bare(screen: Screen, focus: usize) -> Snapshot {
+        Snapshot { screen, focus, cursor: -1, character_count: 0, target_available: false,
+            login_context: false, selected: -1, login_confirmation: false }
+    }
+
+    #[test]
+    fn still_logged_in_presses_enter_only_on_its_settled_dialog() {
+        let s = Duration::from_secs;
+        let (dialog, other) = (bare(Screen::Dialog, 0x900), bare(Screen::Other, 0x700));
+        let mut retry = Retry::new(s(10));
+        assert!(retry.owns(Reply::Pending), "the confirmation's answer belongs to the retry");
+        retry.observe(Reply::Pending);
+        assert_eq!(retry.action(Reply::Pending, other, s(2), s(12)), Action::Wait);
+        assert_eq!(retry.action(Reply::Unknown, other, s(3), s(13)), Action::Wait);
+        // The refusal is read before its dialog has focus: reported once, and
+        // no other menu ever gets its Enter.
+        assert_eq!(retry.action(Reply::StillLoggedIn, other, s(5), s(15)), Action::Refused);
+        for menu in [other, state(Screen::Confirm, 0), state(Screen::Characters, 0), state(Screen::Title, 0)] {
+            assert_eq!(retry.action(Reply::StillLoggedIn, menu, s(5), s(16)), Action::Wait, "{:?}", menu.screen);
+        }
+        // The dialog, once it has held focus for the settle time.
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, SETTLE, s(16)), Action::Wait);
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, DIALOG_SETTLE - POLL, s(17)), Action::Wait);
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, DIALOG_SETTLE, s(17)), Action::Tap(Key::Enter));
+        assert_eq!((retry.sent(s(17)), retry.retries), (1, 1));
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, DIALOG_SETTLE, s(18)), Action::Wait, "no second Enter yet");
+        // A login menu in focus: the dialog closed, though its reply stays in memory.
+        assert_eq!(retry.action(Reply::StillLoggedIn, state(Screen::Title, 0), SETTLE, s(18)), Action::Rearm);
+        for reply in [Reply::StillLoggedIn, Reply::Pending, Reply::Failed(313), Reply::Unknown] {
+            assert!(!retry.owns(reply), "{reply:?} leaves the re-armed navigator alone");
+        }
+        // The navigator confirmed again. The old reply is not this selection's
+        // answer until its request has been seen.
+        retry.confirmed(s(21));
+        assert!(retry.owns(Reply::StillLoggedIn));
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, s(5), s(22)), Action::Wait);
+        retry.observe(Reply::Pending);
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, s(5), s(27)), Action::Refused);
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, s(5), s(27)), Action::Tap(Key::Enter));
+        assert_eq!((retry.sent(s(27)), retry.retries), (1, 2));
+        assert_eq!(retry.limit(), s(15) + RELEASE_WINDOW, "bounded from the first refusal");
+        // A new request after our Enter also means the dialog closed, and a
+        // refusal that follows without a navigator confirmation is the retry's.
+        retry.observe(Reply::Pending);
+        assert_eq!(retry.action(Reply::Pending, other, s(1), s(28)), Action::Rearm);
+        assert!(!retry.owns(Reply::Pending) && retry.owns(Reply::StillLoggedIn));
+    }
+
+    #[test]
+    fn still_logged_in_retries_are_bounded_and_hand_back_on_other_input_or_errors() {
+        let s = Duration::from_secs;
+        let (dialog, other, characters) = (bare(Screen::Dialog, 0x900), bare(Screen::Other, 0x700), state(Screen::Characters, 0));
+        let stops = |retry: &mut Retry, reply: Reply, menu: Snapshot, now: Duration|
+            matches!(retry.action(reply, menu, s(5), now), Action::Stop(_));
+        // A retry whose refusal was read at `at`.
+        let refused = |at: Duration| {
+            let mut retry = Retry::new(s(0));
+            retry.observe(Reply::Pending);
+            assert_eq!(retry.action(Reply::StillLoggedIn, other, s(5), at), Action::Refused);
+            retry
+        };
+        assert_eq!(Retry::new(s(0)).limit(), WATCH, "no refusal: watch the confirmation only");
+        // A failure already in memory at the confirmation is not its answer.
+        let mut retry = Retry::new(s(0));
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, s(5), s(1)), Action::Wait);
+        assert_eq!(retry.action(Reply::Failed(313), other, s(5), s(1)), Action::Wait);
+        // The window from the first refusal.
+        let mut retry = refused(s(5));
+        assert_eq!(retry.action(Reply::StillLoggedIn, dialog, s(5), s(6)), Action::Tap(Key::Enter));
+        retry.sent(s(6));
+        retry.observe(Reply::Pending);
+        assert_eq!(retry.action(Reply::Pending, other, s(5), s(7)), Action::Rearm);
+        assert!(stops(&mut retry, Reply::StillLoggedIn, dialog, s(5) + RELEASE_WINDOW));
+        // The count.
+        let mut retry = Retry::new(s(0));
+        retry.observe(Reply::Pending);
+        retry.retries = MAX_RETRIES;
+        assert!(stops(&mut retry, Reply::StillLoggedIn, dialog, s(1)));
+        // The user closed the dialog themselves and went on.
+        let mut retry = refused(s(1));
+        assert!(stops(&mut retry, Reply::Pending, characters, s(2)));
+        // The dialog never takes focus.
+        let mut retry = refused(s(1));
+        assert_eq!(retry.action(Reply::StillLoggedIn, characters, s(5), s(1) + DIALOG_FOCUS), Action::Wait);
+        assert!(stops(&mut retry, Reply::StillLoggedIn, characters, s(2) + DIALOG_FOCUS));
+        // After Enter, neither the dialog nor a login menu takes focus.
+        let mut retry = refused(s(1));
+        retry.sent(s(2));
+        assert_eq!(retry.action(Reply::StillLoggedIn, other, s(5), s(2) + DIALOG_FOCUS), Action::Wait);
+        assert!(stops(&mut retry, Reply::StillLoggedIn, other, s(3) + DIALOG_FOCUS));
+        // Closed is read from the menu: an unreadable reply does not hide it.
+        let mut retry = refused(s(1));
+        retry.sent(s(2));
+        assert_eq!(retry.action(Reply::Unknown, dialog, s(5), s(5)), Action::Wait);
+        assert_eq!(retry.action(Reply::Unknown, state(Screen::Title, 0), s(5), s(5)), Action::Rearm);
+        // Any other lobby error is left to the user: as the answer, or after the refusal.
+        let mut retry = Retry::new(s(0));
+        retry.observe(Reply::Pending);
+        assert!(stops(&mut retry, Reply::Failed(313), other, s(3)));
+        let mut retry = refused(s(1));
+        retry.sent(s(2));
+        assert!(stops(&mut retry, Reply::Failed(313), dialog, s(3)));
+    }
+
+    #[test]
+    fn nothing_is_decided_until_a_readable_menu_has_settled() {
+        let ms = Duration::from_millis;
+        let title = Snapshot { cursor: 0, ..bare(Screen::Title, 0x200) };
+        let mut login = Login::new(1);
+        for at in [0, 100, 200] { assert_eq!(login.poll(Some(title), Reply::Unknown, ms(at)), None); }
+        // Unreadable, or the window or held keys ruling input out: the wait starts again.
+        assert_eq!(login.poll(None, Reply::Unknown, ms(300)), None);
+        assert_eq!(login.poll(None, Reply::Unknown, ms(900)), None);
+        for at in [1000, 1100, 1200] { assert_eq!(login.poll(Some(title), Reply::Unknown, ms(at)), None); }
+        assert_eq!(login.poll(Some(title), Reply::Unknown, ms(1000) + SETTLE), Some((title, Action::Tap(Key::Enter))));
+        // A queued key, taken or not, makes the menu settle again.
+        login.unsettle();
+        assert_eq!(login.poll(Some(title), Reply::Unknown, ms(1300)), None);
+        assert_eq!(login.poll(Some(title), Reply::Unknown, ms(1300) + SETTLE), Some((title, Action::Tap(Key::Enter))));
+        // Without readable lobby replies the confirmation ends the input, as before.
+        login.sent(state(Screen::Characters, 0), Key::Enter, ms(2000));
+        assert_eq!(login.sent(state(Screen::Confirm, 0), Key::Enter, ms(2400)), Sent::Finished);
+    }
+
+    /// Recorded runs replayed through the worker's own decisions at its poll
+    /// rate, with the lobby states read by the real reader.
+    #[cfg(target_pointer_width = "32")]
+    mod replay {
+        use super::*;
+
+        /// What the game read from a moment on: the focused menu, or the lobby's
+        /// operation, reply state, lobby error and protocol error.
+        #[derive(Clone, Copy)]
+        enum Read { Menu(Option<Snapshot>), Lobby(u32, i32, i32, i32) }
+
+        const ENTER: Action = Action::Tap(Key::Enter);
+
+        /// A log time, "hh:mm:ss.mmm".
+        fn clock(stamp: &str) -> Duration {
+            let n: Vec<u64> = stamp.split([':', '.']).map(|part| part.parse().unwrap()).collect();
+            Duration::from_millis(((n[0] * 60 + n[1]) * 60 + n[2]) * 1000 + n[3])
+        }
+
+        /// A slot-1 worker whose confirmation the game took at `at`.
+        fn confirmed(at: Duration) -> Login {
+            let mut login = Login::new(1);
+            login.replies = true;
+            login.sent(Snapshot { selected: 0, ..state(Screen::Characters, 0) }, Key::Enter, at);
+            assert_eq!(login.sent(Snapshot { selected: 0, ..state(Screen::Confirm, 0) }, Key::Enter, at), Sent::Confirmed { again: false });
+            login
+        }
+
+        /// Polls every POLL from `from` to `until`, or to a stop. `game` answers
+        /// each key it took with what it reads afterwards. Returns every
+        /// decision other than Wait: its time, the menu it was made on, and it.
+        fn run(login: &mut Login, mut script: Vec<(Duration, Read)>, from: Duration, until: Duration,
+            mut game: impl FnMut(Duration, Snapshot) -> Vec<(Duration, Read)>) -> Vec<(Duration, Screen, Action)> {
+            let (mut menu, mut answer) = (None, None);
+            let mut done = Vec::new();
+            let mut now = from;
+            while now < until {
+                script.sort_by_key(|(at, _)| *at);
+                while script.first().is_some_and(|(at, _)| *at <= now) {
+                    match script.remove(0).1 {
+                        Read::Menu(read) => menu = read,
+                        Read::Lobby(operation, reply_state, lobby_error, protocol_error) =>
+                            answer = lobby(operation, reply_state, lobby_error, protocol_error),
+                    }
+                }
+                if let Some((current, action)) = login.poll(menu, reply(answer), now) {
+                    if action != Action::Wait { done.push((now, current.screen, action)); }
+                    match action {
+                        Action::Tap(key) => {
+                            script.extend(game(now, current));
+                            login.sent(current, key, now);
+                            login.unsettle();
+                        }
+                        Action::Stop(_) | Action::Finished => break,
+                        _ => {}
+                    }
+                }
+                now += POLL;
+            }
+            done
+        }
+
+        #[test]
+        fn enter_waits_for_the_dialog_that_follows_the_refusal() {
+            // Live, v1.2.8-test10, PID 30256: the worker started at 01:01:51.336
+            // and the game took its confirmation at 01:02:00.896.
+            let t = |stamp: &str| clock(stamp) - clock("01:01:51.336");
+            let (other, dialog) = (bare(Screen::Other, 0x700), bare(Screen::Dialog, 0x900));
+            let recorded = |gap: bool| {
+                let mut script = vec![
+                    // An unrecognised menu holds focus while the selection is out.
+                    (t("01:02:00.896"), Read::Menu(Some(other))),
+                    (t("01:02:00.896"), Read::Lobby(0, 0, 0, 0)),
+                    (t("01:02:02.565"), Read::Lobby(9, 0, 0, 0)),
+                    (t("01:02:02.815"), Read::Lobby(5, 1, 0, 0)),
+                    // The worker's poll that read the refusal, that menu still settled.
+                    // The old code sent Enter here and the game took it, to no effect.
+                    (t("01:02:07.949"), Read::Lobby(0, -1, 0, 201)),
+                    // No menu was readable right after; the dialog had focus by 01:02:08.395.
+                    (t("01:02:07.950"), Read::Menu(None)),
+                    (t("01:02:08.395"), Read::Menu(Some(dialog))),
+                ];
+                // Without the gap, that menu stays settled until the dialog replaces it.
+                if !gap { script.retain(|(_, read)| !matches!(read, Read::Menu(None))); }
+                script
+            };
+            // The dialog stays in focus, as it did live, whatever is sent.
+            let mut login = confirmed(t("01:02:00.896"));
+            let done = run(&mut login, recorded(true), t("01:02:00.949"), t("01:02:20.000"), |_, _| vec![]);
+            assert_eq!(done, [
+                (t("01:02:07.949"), Screen::Other, Action::Refused),
+                (t("01:02:09.449"), Screen::Dialog, ENTER),
+                (t("01:02:11.449"), Screen::Dialog, ENTER),
+                (t("01:02:13.449"), Screen::Dialog, ENTER),
+                (t("01:02:15.449"), Screen::Dialog, Action::Stop("still-logged-in dialog stayed open after Enter; finish login manually")),
+            ]);
+            assert_eq!(login.retry.as_ref().map(|retry| retry.retries), Some(1), "one refusal, however many presses");
+            // Whatever the poll phase: a key goes only to the dialog, and only
+            // once it has held focus for the settle time.
+            for (phase, gap) in (0..100).flat_map(|phase| [(phase, true), (phase, false)]) {
+                let mut login = confirmed(t("01:02:00.896"));
+                let from = t("01:02:00.897") + Duration::from_millis(phase);
+                let done = run(&mut login, recorded(gap), from, t("01:02:12.000"), |_, _| vec![]);
+                let keys: Vec<_> = done.iter().filter(|(_, _, action)| *action == ENTER).collect();
+                assert_eq!(keys.len(), 2, "phase {phase}");
+                for (at, screen, _) in keys {
+                    assert!(*screen == Screen::Dialog && *at >= t("01:02:08.395") + DIALOG_SETTLE, "phase {phase}: {at:?} on {screen:?}");
+                }
+            }
+            // The first Enter is lost and the second taken. The dialog closes as
+            // it did in test9: gone 124 ms after its Enter, the title menu next.
+            let title = Snapshot { cursor: 0, ..bare(Screen::Title, 0x200) };
+            let mut keys = 0;
+            let mut login = confirmed(t("01:02:00.896"));
+            let done = run(&mut login, recorded(true), t("01:02:00.949"), t("01:02:12.500"), |now, _| {
+                keys += 1;
+                if keys == 2 { vec![(now + Duration::from_millis(124), Read::Menu(Some(title)))] } else { vec![] }
+            });
+            assert_eq!(done[1..], [
+                (t("01:02:09.449"), Screen::Dialog, ENTER),
+                (t("01:02:11.449"), Screen::Dialog, ENTER),
+                (t("01:02:11.949"), Screen::Title, Action::Rearm),
+                (t("01:02:12.049"), Screen::Title, ENTER),
+            ]);
+        }
+
+        #[test]
+        fn the_dismissed_refusal_left_in_memory_is_not_a_new_one() {
+            // Live, v1.2.8-test9, PID 20344: the worker started at 00:52:53.679
+            // and the game took its confirmation at 00:53:03.334.
+            let t = |stamp: &str| clock(stamp) - clock("00:52:53.679");
+            let (other, dialog) = (bare(Screen::Other, 0x700), bare(Screen::Dialog, 0x900));
+            let title = Snapshot { cursor: 0, ..bare(Screen::Title, 0x200) };
+            let characters = Snapshot { focus: 0x300, selected: 0, ..state(Screen::Characters, 0) };
+            let confirm = Snapshot { focus: 0x400, selected: 0, ..state(Screen::Confirm, 0) };
+            let recorded = vec![
+                (t("00:53:03.334"), Read::Menu(Some(other))),
+                (t("00:53:03.334"), Read::Lobby(0, 0, 0, 0)),
+                (t("00:53:05.163"), Read::Lobby(5, 0, 0, 0)),
+                (t("00:53:05.413"), Read::Lobby(5, 1, 0, 0)),
+                // The refusal. No menu settled until its dialog, in focus by 00:53:10.742.
+                (t("00:53:10.425"), Read::Lobby(0, -1, 0, 201)),
+                (t("00:53:10.425"), Read::Menu(None)),
+                (t("00:53:10.742"), Read::Menu(Some(dialog))),
+            ];
+            let mut confirmations = 0;
+            let game = |now: Duration, menu: Snapshot| {
+                let after = |delay: u64, read: Read| (now + Duration::from_millis(delay), read);
+                match menu.screen {
+                    // Recorded: the dialog was gone 124 ms after the Enter it took. The
+                    // title menu then held focus with the refusal still in memory,
+                    // where the old code gave up (00:53:16.051).
+                    Screen::Dialog => vec![after(124, Read::Menu(Some(title)))],
+                    // Not yet seen live after a refusal: the title's Enter is modelled
+                    // on this run's own first connection and login.
+                    Screen::Title => vec![after(100, Read::Menu(Some(other))), after(590, Read::Lobby(2, 1, 0, 0)),
+                        after(893, Read::Lobby(0, 0, 0, 0)), after(1900, Read::Menu(Some(characters)))],
+                    Screen::Characters => vec![after(100, Read::Menu(Some(confirm)))],
+                    // Recorded after this run's confirmation: the selection at +1.829 s
+                    // and +2.079 s, its refusal at +7.091 s, the dialog at +7.408 s.
+                    Screen::Confirm => {
+                        confirmations += 1;
+                        let mut reads = vec![after(100, Read::Menu(Some(other))),
+                            after(1829, Read::Lobby(5, 0, 0, 0)), after(2079, Read::Lobby(5, 1, 0, 0))];
+                        if confirmations == 1 {
+                            reads.extend([after(7091, Read::Lobby(0, -1, 0, 201)), after(7091, Read::Menu(None)),
+                                after(7408, Read::Menu(Some(dialog)))]);
+                        } else {
+                            // The server released the session: accepted, as in PID 6184.
+                            reads.push(after(2330, Read::Lobby(14, 0, 0, 0)));
+                        }
+                        reads
+                    }
+                    _ => vec![],
+                }
+            };
+            let mut login = confirmed(t("00:53:03.334"));
+            let done = run(&mut login, recorded, t("00:53:03.421"), t("00:53:40.000"), game);
+            assert_eq!(done[..4], [
+                (t("00:53:11.121"), Screen::Dialog, Action::Refused),
+                (t("00:53:11.821"), Screen::Dialog, ENTER),
+                (t("00:53:12.321"), Screen::Title, Action::Rearm),
+                // The old reply (201) is still in memory: the navigator acts all the same.
+                (t("00:53:12.421"), Screen::Title, ENTER),
+            ]);
+            let steps: Vec<_> = done.iter().map(|(_, screen, action)| (*screen, *action)).collect();
+            let attempt = [(Screen::Dialog, Action::Refused), (Screen::Dialog, ENTER), (Screen::Title, Action::Rearm),
+                (Screen::Title, ENTER), (Screen::Characters, ENTER), (Screen::Confirm, ENTER)];
+            assert_eq!(steps, [attempt, attempt].concat(), "refused twice, then accepted: nothing more is sent");
+            let retry = login.retry.as_ref().unwrap();
+            assert_eq!((retry.retries, retry.phase, retry.first), (2, Phase::Watch, Some(t("00:53:11.121"))));
+        }
+
+        #[test]
+        fn a_request_that_runs_while_no_menu_is_settled_still_makes_its_refusal_new() {
+            let ms = Duration::from_millis;
+            let (dialog, again) = (bare(Screen::Dialog, 0x900), bare(Screen::Dialog, 0x980));
+            let title = Snapshot { cursor: 0, ..bare(Screen::Title, 0x200) };
+            let script = vec![(ms(0), Read::Menu(Some(dialog))), (ms(0), Read::Lobby(5, 1, 0, 0)), (ms(500), Read::Lobby(0, -1, 0, 201))];
+            let mut titles = 0;
+            let mut login = confirmed(ms(0));
+            let done = run(&mut login, script, ms(100), ms(9000), |now, menu| match menu.screen {
+                Screen::Dialog => vec![(now + ms(124), Read::Menu(Some(title)))],
+                // After the title's first Enter the whole next selection runs,
+                // and is refused, with no menu readable.
+                Screen::Title => {
+                    titles += 1;
+                    if titles > 1 { return vec![]; }
+                    vec![(now + ms(50), Read::Menu(None)), (now + ms(150), Read::Lobby(5, 1, 0, 0)),
+                        (now + ms(450), Read::Lobby(0, -1, 0, 201)), (now + ms(500), Read::Menu(Some(again)))]
+                }
+                _ => vec![],
+            });
+            let keys: Vec<_> = done.iter().filter(|(_, _, action)| *action == ENTER).map(|(_, screen, _)| *screen).collect();
+            assert_eq!(keys, [Screen::Dialog, Screen::Title, Screen::Dialog, Screen::Title]);
+            assert_eq!(login.retry.as_ref().map(|retry| retry.retries), Some(2));
+        }
+    }
+
     #[test]
     fn keyboard_hook_restores_prior_import_and_preserves_later_hooks() {
+        let _one = generations(); // its last drop clears the shared queued key
         let slot = AtomicUsize::new(123);
         let shared = Arc::new(Mutex::new(None));
         let first = KeyboardHook::acquire(Arc::clone(&shared), &slot as *const _ as usize, false).unwrap();
@@ -1251,6 +1892,18 @@ mod tests {
         fixture.0[input_rva + 0x01] = 2; // Real Escape wins over automation.
         assert_eq!(deliver(&input, buffer, |_, _| panic!()), Some(Tap::Skipped));
         fixture.0[input_rva + 0x01] = 0;
+        // The dialog's Enter: only while the lobby still reports the refusal.
+        fixture.menu(OK_MENU, 0);
+        input.expected = fixture.snapshot().unwrap();
+        assert_eq!(input.expected.screen, Screen::Dialog);
+        assert_eq!(deliver(&input, buffer, |_, _| panic!()), Some(Tap::Skipped), "no readable reply");
+        fixture.lobby(5, 1, 0);
+        assert_eq!(deliver(&input, buffer, |_, _| panic!()), Some(Tap::Skipped), "the next request is already out");
+        fixture.lobby(0, -1, 201);
+        assert_eq!(deliver(&input, buffer, dispatch), Some(Tap::Sent));
+        fixture.0[input_rva..input_rva + 257].fill(0);
+        fixture.menu(b"menu    loby2win", 1);
+        assert_eq!(deliver(&input, buffer, |_, _| panic!()), Some(Tap::Skipped), "the dialog closed");
         input.expires = Instant::now() - Duration::from_secs(1);
         assert_eq!(deliver(&input, buffer, |_, _| panic!()), Some(Tap::Cancelled));
     }
@@ -1303,7 +1956,7 @@ mod tests {
         let probe = TitleProbe { layout: fixture.layout() };
         for (menu, category) in [(b"menu    ptc8lice", "warning"),
             (b"menu    loby2win", "title"), (b"menu    dbnamese", "characters"),
-            (b"menu    ptc6yesn", "confirmation"), (b"menu    helpwind", "other")] {
+            (b"menu    ptc6yesn", "confirmation"), (b"menu    helpwind", "other"), (OK_MENU, "other")] {
             fixture.menu(menu, 1);
             assert_eq!(probe.observe().menu, category);
         }
@@ -1340,5 +1993,22 @@ mod tests {
         assert!(!fixture.snapshot().unwrap().login_confirmation);
         fixture.u32(FOCUS_RVA, u32::MAX);
         assert_eq!(fixture.snapshot(), None, "invalid pointers fail closed without overflow");
+    }
+
+    #[test]
+    fn real_reader_tells_the_ok_dialog_from_every_other_menu() {
+        let mut fixture = Fixture::new();
+        fixture.menu(OK_MENU, 0);
+        assert_eq!(fixture.snapshot(), Some(bare(Screen::Dialog, fixture.base() + 0x1000)));
+        fixture.0[0x105D] = 1;
+        assert_eq!(fixture.snapshot(), None, "a disabled dialog is never answered");
+        fixture.0[0x105D] = 0;
+        // Only the exact resource name, as read live: "menu", four spaces, "ok", six spaces.
+        for name in [b"menu    ok     \0", b"menu    ok2     ", b"menu     ok     ", b"menu    okcancel", b"MENU    OK      "] {
+            fixture.menu(name, 0);
+            assert_eq!(fixture.snapshot().map(|state| state.screen), Some(Screen::Other));
+        }
+        fixture.u32(FOCUS_RVA, 0);
+        assert_eq!(fixture.snapshot(), None, "no focused menu is not a screen");
     }
 }

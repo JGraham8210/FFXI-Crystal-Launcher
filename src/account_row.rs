@@ -23,6 +23,15 @@ fn clock_at(at: std::time::Instant) -> String {
     let ago = chrono::Duration::from_std(at.elapsed()).unwrap_or_default();
     (chrono::Local::now() - ago).format("%H:%M").to_string()
 }
+/// The automatic relaunch scheduled for `key`: when and which try.
+pub(crate) fn pending_relaunch(app: &App, key: &str) -> Option<(std::time::Instant, u8)> {
+    app.features.as_ref()?.pending_relaunch(key)
+}
+/// "Relaunching in 42 s (try 2)", counting whole seconds up.
+pub(crate) fn relaunch_text(remaining: std::time::Duration, attempt: u8) -> String {
+    let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+    tf("Relaunching in {seconds} s (try {attempt})", &[("seconds", &seconds), ("attempt", &attempt)])
+}
 /// Whether the row is an account that needs a one-time code before it can sign in. An account
 /// with an authenticator key needs none typed, unless PlayOnline refused one of its codes.
 pub(crate) fn needs_code(app: &App, item: &crate::AccountRow) -> bool {
@@ -32,7 +41,7 @@ pub(crate) fn needs_code(app: &App, item: &crate::AccountRow) -> bool {
 }
 /// Which state an account row shows, in priority order (its colour needs only this).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RowState { Closing, Waiting, Updating, ViewerConfirm, ViewerUpdating, Playing, Starting, SigningIn, SignedIn, Private, NeedsCode, Problem, Idle }
+pub(crate) enum RowState { Closing, Waiting, Updating, ViewerConfirm, ViewerUpdating, Playing, Starting, SigningIn, SignedIn, Private, Relaunching, NeedsCode, Problem, Idle }
 pub(crate) fn row_state(app: &App, item: &crate::AccountRow) -> RowState {
     if item.shutting_down || item.signing_out {
         RowState::Closing
@@ -54,6 +63,8 @@ pub(crate) fn row_state(app: &App, item: &crate::AccountRow) -> RowState {
         RowState::SignedIn
     } else if item.account.mode == AccountMode::Private {
         RowState::Private
+    } else if pending_relaunch(app, &item.key).is_some() {
+        RowState::Relaunching
     } else if needs_code(app, item) && !item.busy && item.pid.is_none() {
         RowState::NeedsCode
     } else if item.problem {
@@ -146,6 +157,12 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
             row
         }
         RowState::Private => view(t("Private server").into(), t("client temporarily unavailable").into()),
+        RowState::Relaunching => {
+            let (at, attempt) = pending_relaunch(app, &item.key).unwrap_or((std::time::Instant::now(), 1));
+            let mut row = view(relaunch_text(at.saturating_duration_since(std::time::Instant::now()), attempt), String::new());
+            row.action = Some((t("Cancel").into(), Message::Feature(crate::features::ui::Msg::CancelRelaunch(item.key.clone())), false));
+            row
+        }
         RowState::NeedsCode => {
             let mut row = view(
                 t("Needs a one-time password").into(),
@@ -160,12 +177,13 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
         }
         RowState::Problem => {
             let mut row = view(item.status_text().into_owned(), String::new());
-            // Code boxes only where a code could be the answer: a refused member login, or a
-            // spent code. A loader that never connected, a crash or a version stop asked for none
+            // Code boxes only where a code could be the answer: a member login PlayOnline
+            // refused for its Square Enix password or code, or a spent code. A loader that never
+            // connected, a crash, a version stop or any other failed login asked for none
             // (live 2026-11-10: two timed-out rows looked like they wanted a code).
             // An authenticator key answers both.
             row.otp = idle && !item.authenticator_ready()
-                && (crate::launch_log::sign_in_refused(&item.status) || item.otp_spent);
+                && (crate::launch_log::code_refused(&item.status) || item.otp_spent);
             if item.log.is_some() && idle {
                 row.action = Some((t("View log").into(), Message::OpenLog(item.key.clone()), false));
             }
@@ -285,9 +303,50 @@ mod tests {
         assert!(!matches!(row_view(&app, &app.accounts[1]).action, Some((_, Message::ShutdownAccount(_), _))));
     }
 
+    #[test]
+    fn the_countdown_counts_whole_seconds_up() {
+        use std::time::Duration;
+        crate::i18n::set(crate::i18n::Lang::En);
+        assert_eq!(relaunch_text(Duration::from_secs(30), 1), "Relaunching in 30 s (try 1)");
+        assert_eq!(relaunch_text(Duration::from_millis(29_100), 2), "Relaunching in 30 s (try 2)");
+        assert_eq!(relaunch_text(Duration::ZERO, 3), "Relaunching in 0 s (try 3)");
+    }
+
+    /// A pending automatic relaunch replaces the end message with a countdown and a Cancel
+    /// that drops it; Play and Cancel both clear it.
+    #[test]
+    fn a_pending_relaunch_shows_a_countdown_and_cancel_instead_of_the_end_message() {
+        crate::i18n::set(crate::i18n::Lang::En);
+        let mut app = crate::tests::app();
+        let dir = std::env::temp_dir().join(format!("xi-account-row-{}", crate::backend::unique_id().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = crate::backend::Config { experiment: dir.clone(), ..crate::backend::Config::default() };
+        let runtime = crate::features::Runtime::new(config, std::sync::Arc::new(|_| {}));
+        runtime.update(|s| { s.recovery.auto_relaunch = true; s.layouts.remember = false; s.layouts.restore = false; }).unwrap();
+        let key = app.accounts[2].key.clone();
+        app.features = Some(runtime.clone());
+        app.accounts[2].problem = true;
+        app.accounts[2].status = t("Game closed after losing its connection").into();
+        assert_eq!(row_view(&app, &app.accounts[2]).label, t("Game closed after losing its connection"));
+        let lost = crate::launch_log::ExitReport { kind: crate::launch_log::ExitKind::Disconnected, exit_status: None, during_startup: false, summary: String::new() };
+        runtime.game_started(crate::features::runtime::GameStart { account: key.clone(), slot: None, label: String::new(), pid: std::process::id() });
+        runtime.game_ended(crate::features::runtime::GameEnd { account: key.clone(), report: Some(lost), user_closed: false, maintenance: false });
+        assert_eq!(row_state(&app, &app.accounts[2]), RowState::Relaunching);
+        let row = row_view(&app, &app.accounts[2]);
+        assert!(row.label.starts_with("Relaunching in ") && row.label.ends_with(" s (try 1)"), "{}", row.label);
+        assert!(matches!(&row.action, Some((label, Message::Feature(crate::features::ui::Msg::CancelRelaunch(k)), false)) if *label == t("Cancel") && *k == key));
+        // Play drops the schedule, so the row is back to the end message.
+        let _ = app.update(Message::Launch(key.clone()));
+        assert!(pending_relaunch(&app, &key).is_none());
+        assert_ne!(row_state(&app, &app.accounts[2]), RowState::Relaunching);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Live 2026-11-10: a loader that never connected left the row with code boxes, which read
-    /// as "this account needs a one-time code". A failed row offers a code only after a refused
-    /// member login or a spent code; any other failure shows its message and View log.
+    /// as "this account needs a one-time code". A failed row offers a code only after a member
+    /// login PlayOnline refused for its Square Enix password or code (user report 2026-11-14:
+    /// never for another failed login) or a spent code; any other failure shows its message
+    /// and View log.
     #[test]
     fn only_a_refused_sign_in_or_a_spent_code_offers_code_boxes_on_a_failed_row() {
         crate::i18n::set(crate::i18n::Lang::En);
@@ -301,8 +360,10 @@ mod tests {
         assert!(!timed_out.otp, "a timeout asks for no code");
         assert!(matches!(timed_out.action, Some((_, Message::OpenLog(_), false))));
         assert!(!app.settings.account_otp.contains(&app.accounts[2].key), "nothing marks the account");
-        app.accounts[2].status = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Ashita v4 via crystal-loader).".into();
-        assert!(row_view(&app, &app.accounts[2]).otp, "a refused member login may want a code");
+        app.accounts[2].status = "Game loader error during startup: Native PlayOnline member login failed (state -1036, POL result -1036). (Ashita v4 via crystal-loader).".into();
+        assert!(!row_view(&app, &app.accounts[2]).otp, "a login that failed for another reason asks for no code");
+        app.accounts[2].status = "Game loader error during startup: Native PlayOnline member login failed (state -5311, POL result -5311). (Ashita v4 via crystal-loader).".into();
+        assert!(row_view(&app, &app.accounts[2]).otp, "a refused Square Enix password or code may want a code");
         app.accounts[2].status = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -19). (Ashita v4 via crystal-loader).".into();
         assert!(!row_view(&app, &app.accounts[2]).otp, "a network failure is no verdict on the account");
         app.accounts[2].otp_spent = true;

@@ -19,6 +19,8 @@ pub enum ExitKind {
     Normal,
     /// `GameStart returned ...; exit code N`.
     Code { code: i32 },
+    /// The game lost its connection in the world and ended through its disconnect dialog.
+    Disconnected,
     /// Ended soon after spawn with nothing recognisable in the log.
     Startup,
     /// Anything else.
@@ -62,6 +64,7 @@ impl ExitReport {
             ExitKind::Normal => t("Game closed normally").into(),
             ExitKind::Code { code } if startup => tf("Game exited during startup with code {code}", &[("code", code)]),
             ExitKind::Code { code } => tf("Game exited with code {code}", &[("code", code)]),
+            ExitKind::Disconnected => t("Game closed after losing its connection").into(),
             ExitKind::Startup => match process {
                 Some(code) => tf("Game exited during startup (process exit {code})", &[("code", &code)]),
                 None => t("Game exited during startup").into(),
@@ -112,6 +115,8 @@ pub enum LoaderEnd {
     Closed,
     /// The user's "Close games instantly" ended the game host (`game_shutdown::terminate`).
     Terminated,
+    /// The loader reported `game_disconnected` for this game before it ended.
+    Disconnected,
 }
 
 /// Classify a loader session's end. `ran` is measured from when the session was handed over.
@@ -122,6 +127,7 @@ pub fn classify_loader_end(end: &LoaderEnd, ran: Duration) -> ExitReport {
         LoaderEnd::Terminated => (ExitKind::Normal, None),
         LoaderEnd::Exit(0) if !during_startup => (ExitKind::Normal, Some(0)),
         LoaderEnd::Exit(code) => (ExitKind::Code { code: *code }, Some(*code)),
+        LoaderEnd::Disconnected => (ExitKind::Disconnected, None),
         LoaderEnd::Error(message) => {
             (ExitKind::LoaderError { message: message.chars().take(160).collect() }, None)
         }
@@ -218,15 +224,32 @@ pub fn network_failure(message: &str) -> bool {
     crate::viewer::is_network_not_ready_message(message) || message.contains("POL result -19)")
 }
 
-/// A sign-in that PlayOnline's member login refused: a verdict on the account, such as its
-/// password, or a one-time code it asked for and was not given. The loader's words are the
-/// same for both (only POL's result number differs, and none is known to mean "a code is
-/// needed"), so a refused sign-in that went without a code may be an account that now uses one.
+/// The loader's words for a member login the core failed, up to its state number.
+const MEMBER_LOGIN_FAILED: &str = "Native PlayOnline member login failed (state ";
+
+/// A sign-in that PlayOnline's member login failed: Crystal starts no further sign-in of that
+/// account by itself. Only POL's result number says why (`code_refused`).
 /// Only the loader's member-login stage counts: its network-level connection fails before any
 /// password or code is sent, a cancelled login gave no verdict, and a network failure (-19) is
 /// none either. An older loader names no stage, so none of its failures count.
 pub fn sign_in_refused(message: &str) -> bool {
-    message.contains("Native PlayOnline member login failed (state ") && !network_failure(message)
+    message.contains(MEMBER_LOGIN_FAILED) && !network_failure(message)
+}
+
+/// The member-login results that PlayOnline's own Viewer answers by asking for the Square Enix
+/// password and one-time code again (app.dll 1019d43a; pol-spec 01 §4.5). It shows every other
+/// one as a plain error.
+const CODE_REFUSALS: [i32; 4] = [-5310, -5311, -5312, -5426];
+
+/// A refused member login (`sign_in_refused`) that a one-time code could answer: PlayOnline
+/// refused the Square Enix password or code. Any other failed member login (a connection lost
+/// during it, the PlayOnline password) says nothing about codes: no code is asked for, and
+/// the account is not taken for one that uses them.
+pub fn code_refused(message: &str) -> bool {
+    let Some((_, numbers)) = message.split_once(MEMBER_LOGIN_FAILED) else { return false };
+    let Some((state, result)) = numbers.split_once(", POL result ") else { return false };
+    let result = result.split_once(')').map_or(result, |(result, _)| result);
+    [state, result].iter().any(|code| code.parse().is_ok_and(|code: i32| CODE_REFUSALS.contains(&code)))
 }
 
 /// A sign-in that ended because its worker or game host went away before reporting a
@@ -315,6 +338,10 @@ mod tests {
         assert!(error.is_problem());
         assert_eq!(classify_loader_end(&LoaderEnd::Closed, short).kind, ExitKind::Startup);
         assert_eq!(classify_loader_end(&LoaderEnd::Closed, long).summary, "Game closed unexpectedly");
+        let lost = classify_loader_end(&LoaderEnd::Disconnected, long);
+        assert_eq!((lost.kind.clone(), lost.exit_status, lost.during_startup), (ExitKind::Disconnected, None, false));
+        assert_eq!(lost.summary, "Game closed after losing its connection");
+        assert!(lost.is_problem());
     }
 
     #[test]
@@ -352,6 +379,7 @@ mod tests {
             classify_loader_end(&LoaderEnd::SignedOut, short),
             ExitReport::other(Some(1)),
             ExitReport::other(None),
+            classify_loader_end(&LoaderEnd::Disconnected, long),
         ];
         for report in &reports {
             assert_eq!(report.message(), report.summary, "{report:?}");
@@ -468,6 +496,31 @@ mod tests {
         // Either stage's -19 is still the network failure that is retried.
         assert!(network_failure("Game loader error during startup: Native PlayOnline network connection failed (state -19, POL result -19). (Windower via crystal-loader)."));
         assert!(network_failure("Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -19). (Windower via crystal-loader)."));
+    }
+
+    /// User report 2026-11-14: an account without one-time codes was asked for one after a crash
+    /// or reconnect. Every refused member login counted as "may need a code". PlayOnline's own
+    /// Viewer asks for the code again only after -5310, -5311, -5312 and -5426 (app.dll 1019d43a);
+    /// -5312 and -5311 are this PC's refused Square Enix password (2026-10-18) and code (2026-11-10).
+    #[test]
+    fn only_playonlines_own_code_refusals_ask_for_a_code() {
+        let failed = |state: i32, result: i32| format!("Game loader error during startup: Native PlayOnline member login failed (state {state}, POL result {result}). (Windower via crystal-loader).");
+        for code in [-5310, -5311, -5312, -5426] {
+            for message in [failed(code, code), failed(code, 0), failed(39, code)] {
+                assert!(sign_in_refused(&message) && code_refused(&message), "{message}");
+            }
+        }
+        // Refused, but not for a code: a lost connection (-1036, -1025, -1039), -202 (2026-11-02).
+        for (state, result) in [(-1036, -1036), (39, -1036), (-1025, -1025), (-1039, -1039), (-202, 0), (-5309, -5309), (-5313, -5313)] {
+            let message = failed(state, result);
+            assert!(sign_in_refused(&message) && !code_refused(&message), "{message}");
+        }
+        // Never another stage's failure, whatever its number.
+        for message in ["Game loader error during startup: Native PlayOnline network connection failed (state -5311, POL result -5311).",
+            "Game loader error during startup: Native PlayOnline login was cancelled at state -5311 (POL result -5311).",
+            "Game loader error during startup: Native PlayOnline login failed (state -5311, POL result -5311).", "Sign-in failed"] {
+            assert!(!code_refused(message), "{message}");
+        }
     }
 
     #[test]

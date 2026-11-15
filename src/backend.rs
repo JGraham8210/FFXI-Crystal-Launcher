@@ -23,11 +23,22 @@ pub struct Config {
     #[serde(default)]
     pub dat_overlays: Vec<PathBuf>,
 }
+/// This user's `%LOCALAPPDATA%` (the temporary folder without one). A test build always gets a
+/// scratch folder instead: a test never reads or replaces the user's settings, accounts or
+/// history, whatever its environment. Live 2026-11-14: `cargo test` runs without
+/// `CRYSTAL_DATA_ROOT` replaced the real settings.json with defaults, and the next launcher
+/// started with every account's character select and sign-in knowledge gone.
+pub(crate) fn local_app_data() -> PathBuf {
+    #[cfg(test)]
+    { std::env::temp_dir().join("crystal-launcher-test-localappdata") }
+    #[cfg(not(test))]
+    { std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir) }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("Crystal-Launcher.exe"));
-        let user_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir).join("Crystal Launcher");
+        let user_data = local_app_data().join("Crystal Launcher");
         let mut config = Self::from_locations(&executable, &user_data);
         if let Some(root) = std::env::var_os("CRYSTAL_DATA_ROOT") {
             config.experiment = PathBuf::from(root);
@@ -745,6 +756,19 @@ fn login_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live 2026-11-14: test runs without `CRYSTAL_DATA_ROOT` replaced the user's settings.json
+    /// (and wrote its launch history), so the next launcher had no character select for any
+    /// account. A test build's data, settings and locks are never in the user's folder.
+    #[test]
+    fn a_test_build_never_touches_the_users_crystal_folder() {
+        let Some(real) = std::env::var_os("LOCALAPPDATA").map(|path| PathBuf::from(path).join("Crystal Launcher")) else { return };
+        let config = Config::default();
+        assert!(!config.experiment.starts_with(&real), "{}", config.experiment.display());
+        assert!(!crate::settings::settings_path(&config).starts_with(&real));
+        assert!(!config.history_path().starts_with(&real));
+        assert!(!crate::session_worker::windower_lock_path().unwrap().starts_with(&real));
+    }
     #[test]
     fn packaged_paths_follow_the_executable_and_keep_each_users_vault_separate() {
         let package = std::env::temp_dir().join(format!("crystal-package-{}", unique_id().unwrap()));

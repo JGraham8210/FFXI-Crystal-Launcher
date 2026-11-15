@@ -56,7 +56,7 @@ pub(crate) fn classify(report: Option<&ExitReport>, user_closed: bool, wer: bool
     if exception || wer { return EndKind::Crash; }
     match &report.kind {
         ExitKind::Normal => EndKind::UserClosed,
-        ExitKind::Code { .. } => EndKind::Disconnect,
+        ExitKind::Code { .. } | ExitKind::Disconnected => EndKind::Disconnect,
         // The host ended without an exit line (or with a plain failure status): it died.
         ExitKind::Other | ExitKind::Startup => EndKind::Crash,
         ExitKind::LoaderError { .. } | ExitKind::WorkerEnded => EndKind::Unknown,
@@ -102,9 +102,9 @@ pub(crate) enum Decision {
     Relaunch { kind: EndKind, at: Instant, attempt: u8 },
 }
 
-/// Waits before automatic attempts 1, 2, 3...: long enough for the server to drop the previous
-/// session (an immediate sign-in can be refused as already connected).
-const BACKOFF: [Duration; 3] = [Duration::from_secs(20), Duration::from_secs(60), Duration::from_secs(180)];
+/// Waits before automatic attempts 1, 2, 3...: short, because the loader retries through
+/// "character is still logged in" (error 201) by itself while the server drops the old session.
+const BACKOFF: [Duration; 3] = [Duration::from_secs(10), Duration::from_secs(30), Duration::from_secs(60)];
 /// A game that ran this long before ending clears its account's attempt history.
 const STABLE: Duration = Duration::from_secs(10 * 60);
 
@@ -185,6 +185,10 @@ mod tests {
         assert_eq!(classify(Some(&report(ExitKind::Code { code: av }, Some(av))), false, false), EndKind::Crash);
         assert_eq!(classify(Some(&report(ExitKind::Code { code: 3 }, Some(3))), false, false), EndKind::Disconnect);
         assert_eq!(classify(Some(&report(ExitKind::Code { code: 3 }, Some(3))), false, true), EndKind::Crash, "a WER record is a crash");
+        // The in-world disconnect dialog's OK (Crystal's or the user's) ends FFXI with an
+        // ordinary result; the loader's game_disconnected report makes it a disconnect.
+        assert_eq!(classify(Some(&report(ExitKind::Disconnected, None)), false, false), EndKind::Disconnect);
+        assert_eq!(classify(Some(&report(ExitKind::Disconnected, None)), true, false), EndKind::UserClosed, "Crystal's own shutdown wins");
         assert_eq!(classify(Some(&report(ExitKind::Other, None)), false, false), EndKind::Crash);
         assert_eq!(classify(Some(&report(ExitKind::Startup, None)), false, false), EndKind::Crash);
         assert_eq!(classify(Some(&report(ExitKind::LoaderError { message: "x".into() }, None)), false, false), EndKind::Unknown);
@@ -222,6 +226,7 @@ mod tests {
             now = at + Duration::from_secs(5);
         }
         assert_eq!(waits, BACKOFF.to_vec());
+        assert_eq!(waits, [10, 30, 60].map(Duration::from_secs).to_vec());
         // The fourth failure inside the window only offers.
         assert_eq!(policy.on_end("a", EndKind::Crash, false, Duration::from_secs(90), now, false, &settings),
             Decision::Offer { kind: EndKind::Crash, held: Held::Limit });

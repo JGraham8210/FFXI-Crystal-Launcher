@@ -84,17 +84,18 @@ impl Objects {
 }
 
 #[repr(C)]
-struct UnicodeString {
-    length: u16,
+pub(crate) struct UnicodeString {
+    pub(crate) length: u16,
     maximum_length: u16,
-    buffer: *const u16,
+    pub(crate) buffer: *const u16,
 }
+/// LDR_DLL_LOADED_NOTIFICATION_DATA (also read by addon_files.rs).
 #[repr(C)]
-struct Loaded {
+pub(crate) struct Loaded {
     flags: u32,
-    full_name: *const UnicodeString,
-    base_name: *const UnicodeString,
-    base: *mut c_void,
+    pub(crate) full_name: *const UnicodeString,
+    pub(crate) base_name: *const UnicodeString,
+    pub(crate) base: *mut c_void,
     size: u32,
 }
 /// What the load callback needs, built before Hook loads. `result`: 0 not
@@ -105,8 +106,8 @@ struct Context<'a> {
     event: &'a [u8],
     result: AtomicU32,
 }
-type Notify = unsafe extern "system" fn(u32, *const Loaded, *mut c_void);
-type Register = unsafe extern "system" fn(u32, Notify, *mut c_void, *mut *mut c_void) -> i32;
+pub(crate) type Notify = unsafe extern "system" fn(u32, *const Loaded, *mut c_void);
+pub(crate) type Register = unsafe extern "system" fn(u32, Notify, *mut c_void, *mut *mut c_void) -> i32;
 type Unregister = unsafe extern "system" fn(*mut c_void) -> i32;
 
 // Windows invokes this under its loader lock, before Hook's own initialization

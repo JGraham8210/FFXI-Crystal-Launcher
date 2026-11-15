@@ -702,7 +702,7 @@ mod tests {
         std::fs::write(&loader, b"loader").unwrap();
         let config = Config { experiment: root.clone(), repository: root.clone(), game_install: Some(root.join("missing-game")), dat_overlays: Vec::new() };
         let plan = super::super::Plan { tool: Tool::Windower, social_only: false, auto_away_minutes: 10,
-            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
+            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
             settings: super::super::ToolSettings { windower: windower.to_string_lossy().into_owned(), loader: loader.to_string_lossy().into_owned(), ..Default::default() } };
         let before = fingerprint(&config, &plan);
         assert_eq!(before, fingerprint(&config, &plan));
@@ -863,7 +863,7 @@ mod tests {
         std::fs::create_dir_all(menu.parent().unwrap()).unwrap();
         let config = Config { experiment: root.clone(), repository: root.clone(), game_install: Some(root.join("game-a")), dat_overlays: Vec::new() };
         let plan = super::super::Plan { tool: Tool::Windower, social_only: false, auto_away_minutes: 10,
-            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
+            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
             settings: super::super::ToolSettings { windower: windower.to_string_lossy().into_owned(), loader: loader.to_string_lossy().into_owned(), ..Default::default() } };
 
         for change in ["game folder", "settings.xml", "menu size", "unsettled XML", "unsettled menu"] {

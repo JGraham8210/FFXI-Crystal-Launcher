@@ -85,7 +85,7 @@ fn word(address: usize) -> Option<usize> { crate::mem::read::<usize>(address) }
 
 /// Replace only a still-owned pointer. An injector installed before us remains
 /// the forwarded target; an injector installed later is never overwritten.
-fn replace(slot: usize, original: &AtomicUsize, wrapper: usize) -> bool {
+pub(crate) fn replace(slot: usize, original: &AtomicUsize, wrapper: usize) -> bool {
     let Some(current) = word(slot).filter(|v| *v != 0) else { return false };
     if current == wrapper { return original.load(Ordering::Acquire) != 0; }
     let previous = original.load(Ordering::Acquire);

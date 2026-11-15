@@ -162,10 +162,21 @@ pub(crate) fn controller_enabled() -> Option<bool> {
     controller_enabled_value(&state.as_ref()?.values)
 }
 
+/// The served `padmode000`'s "keep working in the background" flag, as the
+/// game reads it; None when nothing (or nothing valid) is served.
+pub(crate) fn controller_background() -> Option<bool> {
+    let state = store();
+    crate::controller_record::padmode_flag(served_padmode(&state.as_ref()?.values)?, 4)
+}
+
 fn controller_enabled_value(values: &[RegData]) -> Option<bool> {
+    crate::controller_record::gamepad_enabled(served_padmode(values)?)
+}
+
+fn served_padmode(values: &[RegData]) -> Option<&str> {
     let value = values.iter().find(|value| value.name.eq_ignore_ascii_case("padmode000"))?;
     if value.ty != REG_SZ { return None; }
-    crate::controller_record::gamepad_enabled(std::str::from_utf8(value.data.split(|byte| *byte == 0).next()?).ok()?)
+    std::str::from_utf8(value.data.split(|byte| *byte == 0).next()?).ok()
 }
 
 pub(crate) fn controller_ready() -> bool {
@@ -537,6 +548,7 @@ pub fn apply_to_ffximain() -> bool {
         return false;
     }
     crate::boot_timing::install(base);
+    crate::xinput_filter::install(base);
     crate::graphics::report(base);
     if crate::game::selected_game_directory() {
         // SAFETY: FFXiMain is loaded; retain its original injector/COM import separately

@@ -221,7 +221,7 @@ impl Settings {
             settings.windower_profile = profile.clone();
         }
         Some(Plan { tool, settings, social_only: false,
-            auto_away_minutes: self.auto_away_for(account), auto_login: self.auto_login_for(account), keep_session: self.sign_in_after_game, viewer_gaps: false, trigger: Default::default() })
+            auto_away_minutes: self.auto_away_for(account), auto_login: self.auto_login_for(account), keep_session: self.sign_in_after_game, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() })
     }
 
     /// The account's Auto-Away minutes (0 = off), the Viewer's 10 by default.

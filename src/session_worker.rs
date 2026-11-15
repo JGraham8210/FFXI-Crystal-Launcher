@@ -180,8 +180,12 @@ pub(crate) const WINDOWER_TURN_LIMIT: Duration = Duration::from_secs(90);
 pub(crate) const ASHITA_TURN_LIMIT: Duration = Duration::from_secs(90);
 
 fn locks_directory() -> Result<PathBuf, String> {
-    let root = std::env::var_os("CRYSTAL_DATA_ROOT")
-        .or_else(|| std::env::var_os("LOCALAPPDATA"))
+    // A test build never shares the user's locks (`backend::local_app_data`).
+    #[cfg(test)]
+    let local = Some(crate::backend::local_app_data().into_os_string());
+    #[cfg(not(test))]
+    let local = std::env::var_os("LOCALAPPDATA");
+    let root = std::env::var_os("CRYSTAL_DATA_ROOT").or(local)
         .ok_or(t("Could not locate the Windower launch lock directory."))?;
     Ok(PathBuf::from(root).join("Crystal Launcher/locks"))
 }
@@ -2355,7 +2359,7 @@ mod tests {
             social_only: true, authenticated: true, native_batch: true, otp_used: Some(false), launch_choice: None, launch_tool: Some(Tool::Windower) }).unwrap();
         let original = fs::read(&path).unwrap();
         let plan = Plan { tool: Tool::Vanilla, settings: Default::default(),
-            social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default() };
+            social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
         let error = launch_command(Command::new("must-not-spawn.exe"), &config, account.clone(), Zeroizing::default(),
             Some(plan), Instant::now(), |_| panic!("must stop before reconnect")).err().unwrap();
         assert!(error.contains("before switching launch methods"), "{error}");
@@ -2992,7 +2996,7 @@ mod tests {
 
     fn park_plan() -> Plan {
         Plan { tool: Tool::Windower, settings: Default::default(), social_only: false, auto_away_minutes: 10,
-            auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default() }
+            auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() }
     }
 
     fn play_request(config: &Config, account: Account, trigger: crate::launch_timing::LaunchTrigger) -> Request {
@@ -3212,7 +3216,7 @@ mod tests {
             let config = config(&fixture.0);
             let plan = Plan { tool, settings: Default::default(), social_only: true,
                 auto_away_minutes: 0, auto_login: Default::default(),
-                keep_session: false, viewer_gaps: false, trigger: Default::default() };
+                keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
             let started = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
                 &config, account.clone(), Zeroizing::default(), Some(plan), Instant::now(), |_| {}).unwrap();
             (config, started)
@@ -3291,7 +3295,7 @@ mod tests {
         let account = account();
         let plan = |tool| Plan { tool, settings: Default::default(), social_only: true,
             auto_away_minutes: 0, auto_login: Default::default(),
-            keep_session: false, viewer_gaps: false, trigger: Default::default() };
+            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
         let first = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
             &config, account.clone(), Zeroizing::default(), Some(plan(Tool::Vanilla)), Instant::now(), |_| {}).unwrap();
         let session = find(&config, &account).unwrap();
@@ -3317,7 +3321,7 @@ mod tests {
         let waiter = std::thread::spawn(move || close_idle_sessions(vec![pending]));
         let plan = Plan { tool: Tool::Vanilla, settings: Default::default(), social_only: true,
             auto_away_minutes: 0, auto_login: Default::default(),
-            keep_session: false, viewer_gaps: false, trigger: Default::default() };
+            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
         let launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
             &config, account, Zeroizing::default(), Some(plan), Instant::now(), |_| {}).unwrap();
         waiter.join().unwrap().unwrap();
@@ -3369,7 +3373,7 @@ mod tests {
         let account = account();
         let plan = Plan { tool: Tool::Windower, settings: Default::default(), social_only: true,
             auto_away_minutes: 0, auto_login: Default::default(),
-            keep_session: false, viewer_gaps: false, trigger: Default::default() };
+            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
         let _launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
             &config, account.clone(), Zeroizing::default(), Some(plan), Instant::now(), |_| {}).unwrap();
         let session = find(&config, &account).unwrap();

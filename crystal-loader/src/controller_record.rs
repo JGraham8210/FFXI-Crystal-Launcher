@@ -60,9 +60,14 @@ fn game_dinput8() -> Option<PathBuf> {
 
 /// The game's own `padmode000` gamepad flag; None when malformed.
 pub(crate) fn gamepad_enabled(padmode: &str) -> Option<bool> {
+    padmode_flag(padmode, 0)
+}
+
+/// One `padmode000` flag (0 gamepad on, 4 keep working in the background); None when malformed.
+pub(crate) fn padmode_flag(padmode: &str, index: usize) -> Option<bool> {
     let fields: Vec<_> = padmode.split(',').map(str::trim).collect();
     if fields.len() < 6 || !fields[..6].iter().all(|field| matches!(*field, "0" | "1")) { return None; }
-    Some(fields[0] == "1")
+    Some(fields[index] == "1")
 }
 
 /// Connected XInput slots, from the system xinput1_4.dll, loaded on first use

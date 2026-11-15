@@ -311,6 +311,10 @@ const SOCKET_PREDICATE: &str = "8B 44 24 04 8B 80 ?? ?? ?? ?? 85 C0 75 ?? C3 33 
 const PROTOCOL_ERROR_GETTER: &str = "8B 44 24 04 8B 88 ?? ?? ?? ?? 8B 44 24 08 8B 91 ?? ?? ?? ?? 89 10 B8 01 00 00 00 C3";
 const MAIN_STEP_FN: &str = "51 53 56 8B F1 8B 46 08 83 F8 04 0F 87 ?? ?? ?? ?? FF 24 85 ?? ?? ?? ?? 8B CE E8 ?? ?? ?? ?? 8A D8";
 const MAIN_TICK_FN: &str = "53 56 8B F1 33 DB 39 9E 8C 00 00 00 7C ?? C7 86 8C 00 00 00 FF FF FF FF 39 9E 98 00 00 00 75 ?? 83 BE 90 00 00 00 64 0F 85 ?? ?? ?? ?? 8B 86 ?? ?? ?? ?? C7 86 90 00 00 00 65 00 00 00 89 86 8C 00 00 00 5E B0 01 5B C3 8B 86 ?? ?? ?? ??";
+/// 100daf51: call the POL result getter; store it at +0xB8; test states 0x0C and 0x15.
+const MAIN_STEP_RESULT: &str = "E8 ?? ?? ?? ?? 89 86 ?? ?? ?? ?? 8B 46 14 83 F8 ?? 0F 84 ?? ?? ?? ?? 83 F8 ?? 0F 84";
+/// 10310bbd: a jump through the core's table, slot 705.
+const POL_RESULT_GETTER: &str = "A1 ?? ?? ?? ?? FF A0 04 0B 00 00";
 const MAIN_INIT_FN: &str = "56 8B F1 E8 ?? ?? ?? ?? 3C 01 0F 85 ?? ?? ?? ?? 53 33 DB 89 5E 08 89 5E ?? 89 9E 80 00 00 00 C7 86 90 00 00 00 65 00 00 00";
 const CONNECT_RESOLVER: &str = "55 8B EC 83 EC 18 56 B8 CC CC CC CC 89 45 E8 89 45 EC 89 45 F0 89 45 F4 89 45 F8 89 45 FC 8B F4 8B 45 0C 50 FF 15 ?? ?? ?? ??";
 const COUNT_GETTER: &str = "A1 ?? ?? ?? ?? 8B 80 ?? ?? ?? ?? C3";
@@ -558,6 +562,12 @@ fn diagnostics(c: &Ctx, lobby: &Lobby) -> Found<Diagnostics> {
     c.shape(step_fn, "main step", MAIN_STEP_FN)?;
     let tick = c.call(step_fn + 0x1A)?;
     c.shape(tick, "main tick", MAIN_TICK_FN)?;
+    // The step then stores the core's POL result and tests the two fatal stop states.
+    c.shape(step_fn + 0x21, "main step POL result", MAIN_STEP_RESULT)?;
+    c.shape(c.call(step_fn + 0x21)?, "POL result getter", POL_RESULT_GETTER)?;
+    expect("main.pol_result", c.dword(step_fn + 0x28)?, l::MAIN_POL_RESULT)?;
+    expect("main stop states", c.byte(step_fn + 0x31)? << 8 | c.byte(step_fn + 0x3A)?,
+        (l::MAIN_STOP_ERROR as usize) << 8 | l::MAIN_STOP_LOST as usize)?;
     let init_fn = c.call(init_call + 6)?;
     c.shape(init_fn, "main init", MAIN_INIT_FN)?;
     expect("main.init body", init, init_fn + 0x13)?;

@@ -10,6 +10,13 @@ use crate::launch_log::ExitReport;
 use crate::{App, WorkerEvent};
 use std::sync::{Arc, Mutex};
 
+/// Recovery relaunches by itself, so a launch's loader may press OK on FFXI's in-world
+/// disconnect dialog (the game then ends and is relaunched). A free function: the play paths
+/// call it while holding a row.
+pub(crate) fn dismiss_disconnect(features: &Option<Runtime>) -> bool {
+    features.as_ref().is_some_and(|runtime| runtime.settings().recovery.auto_relaunch)
+}
+
 impl App {
     /// Start the runtime (nothing runs until something is configured or a game starts).
     pub(crate) fn start_features(&mut self) {

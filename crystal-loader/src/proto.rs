@@ -253,6 +253,9 @@ pub struct Session {
     /// Viewer auto-Away minutes: 0 off, else 10..=60; absent = 10 (app table
     /// 10490d00, default index 0).
     pub auto_away_minutes: u32,
+    /// Press OK on the in-world disconnect dialog: the launcher's Recovery
+    /// relaunches by itself. Absent = false.
+    pub dismiss_disconnect: bool,
     /// Optional foreground-only navigation of the real game login menus.
     pub auto_login: AutoLogin,
     /// FFXI settings this process reads instead of the registry (`ffxi_settings`); `None`
@@ -459,8 +462,9 @@ pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
     let keep_session = flag("keep_session", false)?;
     let viewer_gaps = flag("viewer_gaps", false)?;
     let auto_away_minutes = auto_away_minutes(get("auto_away_minutes"))?;
+    let dismiss_disconnect = flag("dismiss_disconnect", false)?;
     let auto_login = parse_auto_login(get("auto_login"))?;
-    Ok(Session { region, ucs_area, install_dir, pol_install_dir, native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, auto_login, ffxi_settings })
+    Ok(Session { region, ucs_area, install_dir, pol_install_dir, native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, auto_login, ffxi_settings })
 }
 
 /// Viewer auto-Away minutes: 0 off, else 10..=60; absent = 10.
@@ -499,6 +503,7 @@ pub struct Unpark {
     pub keep_session: bool,
     pub viewer_gaps: bool,
     pub auto_away_minutes: u32,
+    pub dismiss_disconnect: bool,
 }
 
 impl fmt::Debug for Unpark {
@@ -522,10 +527,10 @@ impl Park {
     /// The session a direct `session` line with the same fields gives, so the
     /// parked path continues exactly like the cold one (07d §1.4).
     pub fn into_session(self, unpark: Unpark) -> Session {
-        let Unpark { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes } = unpark;
+        let Unpark { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect } = unpark;
         Session {
             region: self.region, ucs_area: self.ucs_area, install_dir: self.install_dir, pol_install_dir: self.pol_install_dir,
-            native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes,
+            native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect,
             auto_login: self.auto_login, ffxi_settings: self.ffxi_settings,
         }
     }
@@ -537,7 +542,7 @@ const LEGACY_FIELDS: [&str; 5] = ["v_key", "auth_code", "account_id", "pol_recor
 /// except `native_auth`.
 const SECRET_FIELDS: [&str; 6] = ["v_key", "auth_code", "account_id", "pol_records", "content_ids", "native_auth"];
 /// Per-Play flags: only in `credentials` (or a direct `session`).
-const PLAY_FIELDS: [&str; 4] = ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes"];
+const PLAY_FIELDS: [&str; 5] = ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes", "dismiss_disconnect"];
 /// Host fields: only in `park` (or a direct `session`).
 const HOST_FIELDS: [&str; 7] = ["region", "lang", "install_dir", "pol_install_dir", "ffxi_settings", "auto_login", "ucs_area"];
 
@@ -661,7 +666,8 @@ pub fn parse_credentials(line: &[u8]) -> Result<Unpark, ProtoError> {
     };
     let auto_away_minutes = auto_away_minutes(get("auto_away_minutes"))?;
     let (start_game, keep_session) = (flag("start_game", true)?, flag("keep_session", false)?);
-    Ok(Unpark { native_auth, start_game, keep_session, viewer_gaps: flag("viewer_gaps", false)?, auto_away_minutes })
+    Ok(Unpark { native_auth, start_game, keep_session, viewer_gaps: flag("viewer_gaps", false)?, auto_away_minutes,
+        dismiss_disconnect: flag("dismiss_disconnect", false)? })
 }
 
 /// `ffxi_settings`: value name -> JSON number (`REG_DWORD`, -2^31..2^32-1) or string (`REG_SZ`).
@@ -731,6 +737,13 @@ pub fn game_shutdown_result(id: u64, game: u64, ok: bool, message: &str) -> Stri
 
 pub fn controller_result(id: u64, ok: bool, message: &str) -> String {
     format!("{{\"type\":\"controller_result\",\"request_id\":{id},\"ok\":{ok},\"message\":{}}}\n", json_string(message))
+}
+
+/// The game in the world lost its connection: the client requested a fatal
+/// network stop (`state`) and its disconnect dialog follows. `code`: the POL
+/// result at that moment. The game ends after its OK.
+pub fn game_disconnected_line(state: u32, code: i32) -> String {
+    format!("{{\"type\":\"game_disconnected\",\"state\":{state},\"code\":{code}}}\n")
 }
 
 pub fn exit_line(code: i32) -> String {
@@ -1148,6 +1161,40 @@ mod tests {
         assert_eq!((a.pol_id, a.otp, &a.profile_key), (b.pol_id, b.otp, &b.profile_key));
         // The direct session line still parses as before.
         assert!(matches!(parse_first_line(line(&native_fields()).as_bytes()), Ok(FirstLine::Session(_))));
+    }
+
+    #[test]
+    fn disconnect_dismissal_is_a_per_play_flag_off_by_default() {
+        assert!(!parse_session(line(&native_fields()).as_bytes()).unwrap().dismiss_disconnect);
+        assert!(parse_session(line(&format!("{},\"dismiss_disconnect\":true", native_fields())).as_bytes()).unwrap().dismiss_disconnect);
+        assert!(!parse_credentials(credentials_line("").as_bytes()).unwrap().dismiss_disconnect);
+        let FirstLine::Park(park) = parse_first_line(PARK_LINE.as_bytes()).unwrap() else { panic!("not a park") };
+        assert!(park.into_session(parse_credentials(credentials_line(",\"dismiss_disconnect\":true").as_bytes()).unwrap()).dismiss_disconnect);
+        for bad in [",\"dismiss_disconnect\":1", ",\"dismiss_disconnect\":true,\"dismiss_disconnect\":true"] {
+            assert!(parse_credentials(credentials_line(bad).as_bytes()).is_err(), "{bad}");
+        }
+        let park = PARK_LINE.strip_suffix('}').unwrap();
+        assert!(parse_first_line(format!("{park},\"dismiss_disconnect\":true}}").as_bytes()).is_err(), "never in a park line");
+        assert_eq!(game_disconnected_line(0x15, -2059), "{\"type\":\"game_disconnected\",\"state\":21,\"code\":-2059}\n");
+    }
+
+    /// Live 2026-11-15 (test builds 7, 8): character select never started. The launcher's
+    /// own lines for a Play with character select on (src/main_tests.rs
+    /// `every_play_path_sends_character_select_to_the_loader` checks it still writes exactly
+    /// these) must reach the game as on, with the disconnect flag beside it: a direct
+    /// session, and a parked host's park line plus its Play's credentials.
+    #[test]
+    fn the_launchers_play_lines_keep_character_select_on() {
+        let lines: Vec<&str> = include_str!("../tests/fixtures/launcher_play_lines.jsonl").lines().collect();
+        let [session, park, credentials] = lines[..] else { panic!("three fixture lines") };
+        let with_credentials = |head: &str| format!("{},{}}}\n", head.strip_suffix('}').unwrap(), native_fields());
+        let on = AutoLogin { enabled: true, character_slot: 2 };
+        let direct = parse_session(with_credentials(session).as_bytes()).unwrap();
+        assert_eq!((direct.auto_login, direct.dismiss_disconnect), (on, true));
+        let FirstLine::Park(park) = parse_first_line(park.as_bytes()).unwrap() else { panic!("not a park") };
+        assert_eq!(park.auto_login, on);
+        let parked = park.into_session(parse_credentials(with_credentials(credentials).as_bytes()).unwrap());
+        assert_eq!((parked.auto_login, parked.dismiss_disconnect), (on, true));
     }
 
     #[test]

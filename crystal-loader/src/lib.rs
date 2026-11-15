@@ -13,10 +13,12 @@ mod boot_timing;
 mod controller_catalog;
 mod controller_record;
 mod controller_settings;
+mod disconnect;
 mod feature_check;
 mod game_modules;
 mod game_shutdown;
 mod graphics;
+mod xinput_filter;
 pub mod b64;
 pub mod wire;
 pub mod events;
@@ -54,6 +56,10 @@ mod hook_layout;
 mod windower_start;
 #[cfg(target_arch = "x86")]
 mod windower_plugin_settings;
+#[cfg(target_arch = "x86")]
+mod reshade_input;
+#[cfg(target_arch = "x86")]
+mod addon_files;
 
 use std::time::Duration;
 
@@ -307,8 +313,14 @@ fn fail(pipe: &Pipe, code: i32, msg: String) -> i32 {
 }
 
 fn log_session(session: &proto::Session) {
-    log!("stage: session ok (v{}, region {}, install_dir {})", proto::PROTOCOL_VERSION, session.region.name(),
-        session.install_dir.as_deref().unwrap_or("(none)"));
+    // What this game's own login does, as the park line says it: a launch without
+    // character select must be visible here, not only by the worker's silence.
+    log!("stage: session ok (v{}, region {}, install_dir {}, auto_login {}, dismiss_disconnect {})", proto::PROTOCOL_VERSION, session.region.name(),
+        session.install_dir.as_deref().unwrap_or("(none)"), auto_login_text(session.auto_login), session.dismiss_disconnect);
+}
+
+fn auto_login_text(auto_login: proto::AutoLogin) -> String {
+    if auto_login.enabled { format!("on (slot {})", auto_login.character_slot) } else { "off".into() }
 }
 
 fn log_ffxi_settings(settings: Option<&ffxi_settings::FfxiSettings>) {
@@ -322,7 +334,7 @@ fn run_session(pipe: Pipe, reader: LineReader, session: proto::Session) -> i32 {
     log_session(&session);
     log_ffxi_settings(session.ffxi_settings.as_ref());
     ffxi_settings::install(session.ffxi_settings);
-    let cfg = game::GameConfig { region: session.region, ucs_area: session.ucs_area, install_dir: session.install_dir, pol_install_dir: session.pol_install_dir, native_auth: Some(session.native_auth), start_game: session.start_game, keep_session: session.keep_session, viewer_gaps: session.viewer_gaps, auto_away_minutes: session.auto_away_minutes, auto_login: session.auto_login };
+    let cfg = game::GameConfig { region: session.region, ucs_area: session.ucs_area, install_dir: session.install_dir, pol_install_dir: session.pol_install_dir, native_auth: Some(session.native_auth), start_game: session.start_game, keep_session: session.keep_session, viewer_gaps: session.viewer_gaps, auto_away_minutes: session.auto_away_minutes, dismiss_disconnect: session.dismiss_disconnect, auto_login: session.auto_login };
     events::start(pipe, reader);
     let game = spawn_game(move || game::run(cfg));
     finish(game.and_then(join_game))
@@ -345,12 +357,12 @@ fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park) -> i32 
     let park_started = std::time::Instant::now();
     log!("stage: park ok (v{}, region {}, install_dir {}, ffxi_settings {}, auto_login {})",
         proto::PROTOCOL_VERSION, park.region.name(), park.install_dir.as_deref().unwrap_or("(none)"),
-        park.ffxi_settings.as_ref().map_or(0, |fx| fx.len()), if park.auto_login.enabled { "on" } else { "off" });
+        park.ffxi_settings.as_ref().map_or(0, |fx| fx.len()), auto_login_text(park.auto_login));
     log_ffxi_settings(park.ffxi_settings.as_ref());
     ffxi_settings::install(park.ffxi_settings.take());
     let cfg = game::GameConfig { region: park.region, ucs_area: park.ucs_area.clone(), install_dir: park.install_dir.clone(), pol_install_dir: park.pol_install_dir.clone(),
         native_auth: None, start_game: false, keep_session: false, viewer_gaps: false, auto_away_minutes: 0,
-        auto_login: park.auto_login };
+        dismiss_disconnect: false, auto_login: park.auto_login };
     let (ready_tx, ready) = std::sync::mpsc::channel();
     let (play, play_rx) = std::sync::mpsc::channel();
     let game = match spawn_game(move || game::run_parked(cfg, ready_tx, play_rx)) {
@@ -381,10 +393,10 @@ fn run_parked(pipe: Pipe, mut reader: LineReader, mut park: proto::Park) -> i32 
     };
     let session = park.into_session(unpark);
     log_session(&session);
-    let proto::Session { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, .. } = session;
+    let proto::Session { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, .. } = session;
     events::start(pipe, reader);
     // The game thread is parked waiting for exactly this; its sign-in follows.
-    let sent = play.send(game::Play { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes });
+    let sent = play.send(game::Play { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect });
     let result = join_game(game);
     finish(match (sent, result) {
         (Err(_), Ok(_)) => Err("the parked game host ended before the Play".into()),

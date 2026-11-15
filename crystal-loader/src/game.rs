@@ -186,6 +186,8 @@ pub struct GameConfig {
     /// Session `viewer_gaps` (sign-in-only sessions; 07c §4).
     pub viewer_gaps: bool,
     pub auto_away_minutes: u32,
+    /// Press OK on the in-world disconnect dialog (Recovery relaunches by itself).
+    pub dismiss_disconnect: bool,
     pub auto_login: proto::AutoLogin,
 }
 
@@ -507,6 +509,7 @@ pub struct Play {
     pub keep_session: bool,
     pub viewer_gaps: bool,
     pub auto_away_minutes: u32,
+    pub dismiss_disconnect: bool,
 }
 
 /// Runs the game to completion. Errors are plain stage descriptions (no secrets).
@@ -524,7 +527,8 @@ pub fn run_parked(mut cfg: GameConfig, ready: std::sync::mpsc::Sender<std::time:
         let _ = ready.send(polcore);
         let Some(play) = crate::park::wait_for_play(&play, crate::park::PUMP, &mut crate::native_auth::pump_idle_messages) else { return false };
         cfg.native_auth = Some(play.native_auth);
-        (cfg.start_game, cfg.keep_session, cfg.viewer_gaps, cfg.auto_away_minutes) = (play.start_game, play.keep_session, play.viewer_gaps, play.auto_away_minutes);
+        (cfg.start_game, cfg.keep_session, cfg.viewer_gaps, cfg.auto_away_minutes, cfg.dismiss_disconnect) =
+            (play.start_game, play.keep_session, play.viewer_gaps, play.auto_away_minutes, play.dismiss_disconnect);
         true
     };
     run_with(&mut cfg, Some(&mut park))
@@ -675,6 +679,10 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
         Ok(false) => {}
         Err(reason) => crate::windower_plugin_settings::report_unprotected(&reason),
     }
+    #[cfg(target_arch = "x86")]
+    crate::reshade_input::install();
+    #[cfg(target_arch = "x86")]
+    crate::addon_files::install();
     let mut play = cfg.start_game;
     let outcome = loop {
         if !play && !session.wait_for_game()? {
@@ -691,7 +699,7 @@ fn run_in_apartment(cfg: &mut GameConfig, park: Option<ParkHook<'_>>) -> Result<
             play = false;
             continue;
         }
-        let Some(outcome) = run_game(&polcore, &ffxi_dir, table, &mut session, cfg.auto_login)? else {
+        let Some(outcome) = run_game(&polcore, &ffxi_dir, table, &mut session, cfg.auto_login, cfg.dismiss_disconnect)? else {
             log!("stage: the launcher signed out before the game started; no game");
             break GameOutcome { code: 0, message: String::new(), game_returned: false, modules_released: false };
         };
@@ -740,7 +748,8 @@ fn windower_hook_loaded() -> bool {
 }
 
 /// `None`: the launcher's startup sign-out (acknowledged to it) came before the game took over.
-fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate::native_auth::NativeSession, auto_login: proto::AutoLogin) -> Result<Option<GameOutcome>, String> {
+fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate::native_auth::NativeSession, auto_login: proto::AutoLogin,
+    dismiss_disconnect: bool) -> Result<Option<GameOutcome>, String> {
     if crate::native_auth::sign_in_cancelled() { return Ok(None); }
     #[cfg(target_arch = "x86")]
     crate::windower_start::coordinate(&mut || session.startup_frame())?;
@@ -780,6 +789,7 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate
     let auto_login = crate::auto_login::Worker::start(auto_login);
     let live_controller = crate::controller_settings::Worker::start();
     let shutdown = crate::game_shutdown::Worker::start();
+    let disconnect = crate::disconnect::Worker::start(dismiss_disconnect);
     #[cfg(target_arch = "x86")]
     crate::windower_plugin_settings::game_starting();
     let awake = crate::awake::Awake::begin();
@@ -793,6 +803,7 @@ fn run_game(polcore: &Com, ffxi_dir: &Path, table: &[usize], session: &mut crate
     drop(awake);
     log!("stage: GameStart returned hr={hr:#010x}");
     // Stop all input before game callbacks/interfaces can be detached or freed.
+    drop(disconnect);
     log!("stage: stopping background shutdown worker");
     drop(shutdown);
     log!("stage: stopping live controller worker");

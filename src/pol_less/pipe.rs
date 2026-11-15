@@ -37,6 +37,9 @@ pub(crate) enum LoaderEvent {
     /// `native_own_portrait`: the selected handle's portrait ID (13 bits).
     NativeOwnPortrait(u16),
     NativeGameEnded { code: i32, game_returned: bool, game_id: u64 },
+    /// `game_disconnected`: the game in the world lost its connection (the client's fatal
+    /// network stop `state`, 0x0C or 0x15) and ends after its dialog. `code`: the POL result.
+    GameDisconnected { state: u32, code: i32 },
     NativeSignOutComplete(i32),
     NativeControlResult { action: String, code: i32 },
     ControllerResult { id: u64, ok: bool, message: String },
@@ -126,6 +129,8 @@ struct Incoming {
     game_id: Option<u64>,
     #[serde(default)]
     ok: Option<bool>,
+    #[serde(default)]
+    state: Option<u64>,
 }
 
 /// Parse one loader line (without its `\n`).
@@ -178,6 +183,10 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
             code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid game exit result.")?,
             game_returned: value.game_returned,
             game_id: value.game_id.unwrap_or(0),
+        },
+        "game_disconnected" => LoaderEvent::GameDisconnected {
+            state: value.state.filter(|s| matches!(s, 0x0C | 0x15)).ok_or("Invalid game disconnect state.")? as u32,
+            code: value.code.and_then(|c| i32::try_from(c).ok()).ok_or("Invalid game disconnect result.")?,
         },
         "native_sign_out_complete" => LoaderEvent::NativeSignOutComplete(
             value.code.and_then(|c| i32::try_from(c).ok()).filter(|c| *c <= 0)
@@ -747,6 +756,14 @@ mod tests {
         assert_eq!(parse_event(br#"{"type":"native_game_ended","code":-14,"game_returned":true,"game_id":2}"#).unwrap(),
             LoaderEvent::NativeGameEnded { code: -14, game_returned: true, game_id: 2 });
         assert!(parse_event(br#"{"type":"native_game_ended","code":-14,"game_returned":"true"}"#).is_err());
+        assert_eq!(parse_event(br#"{"type":"game_disconnected","state":21,"code":-2059}"#).unwrap(),
+            LoaderEvent::GameDisconnected { state: 0x15, code: -2059 });
+        assert_eq!(parse_event(br#"{"type":"game_disconnected","state":12,"code":0}"#).unwrap(),
+            LoaderEvent::GameDisconnected { state: 0x0C, code: 0 });
+        for bad in [br#"{"type":"game_disconnected","state":6,"code":0}"#.as_slice(), br#"{"type":"game_disconnected","code":0}"#,
+            br#"{"type":"game_disconnected","state":21}"#] {
+            assert!(parse_event(bad).is_err());
+        }
         assert_eq!(
             parse_event(b"{\"type\":\"error\",\"message\":\"FFXiMain.dll\\nmissing\"}\r").unwrap(),
             LoaderEvent::Error("FFXiMain.dll missing".into())

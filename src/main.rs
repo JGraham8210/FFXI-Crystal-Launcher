@@ -2039,7 +2039,7 @@ impl App {
         for (key, session) in keys {
             let Some(row) = self.accounts.iter_mut().find(|row| row.key == key
                 && (row.can_play() || row.queued_signin_play() && row.queued_play == Some(clicked))) else { continue; };
-            let Some(mut via) = self.launch_tools.launch_plan(&self.settings, &row.account) else { continue; };
+            let Some(mut via) = play_plan(&self.launch_tools, &self.settings, &self.features, &row.account) else { continue; };
             via.trigger = trigger;
             row.launch_trigger = Some(trigger);
             row.network_wait = None;
@@ -3242,7 +3242,7 @@ impl App {
             }
             // the account's own launcher, boot config and profile,
             // over the Launch tools defaults. All retail routes use the same session worker.
-            let mut via = self.launch_tools.launch_plan(&self.settings, &account);
+            let mut via = play_plan(&self.launch_tools, &self.settings, &self.features, &account);
             let trigger = trigger.unwrap_or(if social_only { LaunchTrigger::Connect } else { LaunchTrigger::Play });
             // Named before a parked host renames it (ParkedConnect).
             let presign_login = social_only && trigger.is_presign();
@@ -4031,6 +4031,7 @@ impl App {
             && !self.startup_signin_pending && self.startup_waiting.is_empty()
             && self.waiting_plays.is_empty() && self.play_updates.jobs.is_empty() && self.launcher_changes.is_empty()
             && self.recovering.is_none() && !self.closing && self.parks_settled
+            && self.accounts.iter().all(|row| account_row::pending_relaunch(self, &row.key).is_none())
             && self.accounts.iter().all(|row| row.resign.is_none() && row.network_wait.is_none()
                 && row.queued_play.is_none() && !row.shutting_down && !row.signing_out && !row.batch_requested)
     }
@@ -4474,6 +4475,9 @@ impl App {
                 let mut play_update = None;
                 // Whether the account's sign-in took a one-time code, learned from a session.
                 let mut uses_otp = None;
+                // Crystal's own sign-in was refused, and not for a code: what the account's
+                // sign-ins take is unknown again (in neither set), until one works.
+                let mut unlearn = false;
                 // A sign-in that reached a verdict on the account (no network or host failure that
                 // is retried): a Play waiting on it waits no longer.
                 let mut verdict = false;
@@ -4605,15 +4609,20 @@ impl App {
                             // without a code undoes this. Only the row's own refusal counts: a
                             // batch reports another account's failure to every account in it, and
                             // one that got its session (Ready) was not refused.
+                            // User report 2026-11-14: only a refusal PlayOnline's own Viewer asks
+                            // a code for says so (`code_refused`). Any other (a connection lost in
+                            // the login after a crash) asks for none: the account is only no
+                            // longer known to sign in without one, so its next Play signs it in.
                             let refused = row.presign_login && !row.otp_spent && row.pid.is_none()
                                 && launch_log::sign_in_refused(message);
-                            let stops_presigning = refused && self.settings.presigns(&key);
-                            if refused { uses_otp = Some(true); }
+                            let wants_code = launch_log::code_refused(message);
+                            let stops_presigning = refused && wants_code && self.settings.presigns(&key);
+                            if refused && wants_code { uses_otp = Some(true); }
+                            unlearn = refused && !wants_code;
                             // The row's own member login refused a code its authenticator key made
                             // (no code was typed): the key is likely wrong. Nothing signs it in
                             // again by itself; the row asks for a typed code (`needs_code`).
-                            let key_refused = row.authenticator_ready() && !row.otp_spent && row.pid.is_none()
-                                && launch_log::sign_in_refused(message);
+                            let key_refused = row.authenticator_ready() && !row.otp_spent && row.pid.is_none() && wants_code;
                             if key_refused { row.authenticator_refused = true; }
                             row.status = if key_refused { t("Authenticator code refused. Check the key.").into() } else { message.to_owned() };
                             row.set_note(if row.network_wait.is_some() {
@@ -4639,6 +4648,9 @@ impl App {
                 // The session worker's W20 and W2U wrote what the server said.
                 self.reload_official();
                 if let Some(uses) = uses_otp { self.note_otp_account(&key, uses); }
+                if unlearn && self.settings.account_no_otp.remove(&key) && !self.preview {
+                    let _ = save_settings(&self.config, &self.settings);
+                }
                 // A waiting Play whose sign-in (startup, Connect) was refused keeps the refusal on
                 // its row instead of waiting to sign in again into the same verdict: a refused
                 // password or account never costs a second login. One stopped for a PlayOnline
@@ -6401,6 +6413,16 @@ fn startup_task_runner() -> impl FnMut(&[String]) -> Result<(bool, String), Stri
 
 /// Close park workers on their own thread, so a re-park or a suspension never holds the UI.
 /// If the thread cannot start, dropping them closes their stdin: they clean up themselves.
+/// What a Play of `account` launches with: its launch plan from the saved settings (tool,
+/// auto-away, character select) and the Recovery choice. Every Play path takes its plan here
+/// (one Play, a batch, a relaunch, a pre-sign-in); a free function, as the batch path holds a row.
+fn play_plan(launch_tools: &launch_tools::State, settings: &Settings, features: &Option<features::Runtime>,
+    account: &Account) -> Option<pol_less::Plan> {
+    let mut plan = launch_tools.launch_plan(settings, account)?;
+    plan.dismiss_disconnect = features::wiring::dismiss_disconnect(features);
+    Some(plan)
+}
+
 fn close_parks_later(workers: Vec<session_worker::ParkWorker>) {
     if workers.is_empty() { return; }
     let _ = std::thread::Builder::new().name("park-close".into()).spawn(move || pol_less::park::close_workers(workers));

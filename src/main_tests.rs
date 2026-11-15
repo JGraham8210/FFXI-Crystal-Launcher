@@ -4181,7 +4181,7 @@ fn a_first_play_teaches_whether_the_account_is_pre_signed() {
 /// next sign-in without a code that works makes it pre-signed again.
 #[test]
 fn a_refused_pre_sign_in_marks_the_account_otp_and_is_not_retried() {
-    let refused = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+    let refused = "Game loader error during startup: Native PlayOnline member login failed (state -5311, POL result -5311). (Windower via crystal-loader).";
     for trigger in [launch_timing::LaunchTrigger::StartupSignIn, launch_timing::LaunchTrigger::SignInAfterGame,
         launch_timing::LaunchTrigger::StartupRetry, launch_timing::LaunchTrigger::SignInAfterGameRetry] {
         assert!(trigger.is_presign());
@@ -4219,6 +4219,46 @@ fn a_refused_pre_sign_in_marks_the_account_otp_and_is_not_retried() {
     let _ = std::fs::remove_dir_all(&app.config.experiment);
 }
 
+/// User report 2026-11-14: after a crash or reconnect an account without one-time codes was
+/// asked for one. Crystal's own sign-in after the game failed in the member login for another
+/// reason (PlayOnline's Viewer asks for the code again only after -5310, -5311, -5312, -5426),
+/// and every refused member login counted. Such a failure asks for no code and marks nothing:
+/// the row shows it, and, as for any refused login, Crystal starts no other sign-in of the
+/// account by itself until one works again (its next Play).
+#[test]
+fn a_pre_sign_in_refused_for_another_reason_asks_for_no_code() {
+    i18n::set(i18n::Lang::En);
+    for refused in ["Game loader error during startup: Native PlayOnline member login failed (state -1036, POL result -1036). (Windower via crystal-loader).",
+        "Game loader error during startup: Native PlayOnline member login failed (state -202, POL result 0). (Windower via crystal-loader)."] {
+        let (mut app, key) = resign_app("presign-refused-no-code");
+        let row = &mut app.accounts[0];
+        (row.busy, row.preparing_session, row.launch_trigger, row.presign_login) = (true, true, Some(launch_timing::LaunchTrigger::SignInAfterGame), true);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Err(refused.into())));
+        let row = &app.accounts[0];
+        assert_eq!(row.status_text(), refused, "no 'may need a one-time password' note");
+        assert!(!app.settings.account_otp.contains(&key) && !wants_typed_code(&app.settings, row), "{refused}");
+        assert_eq!(account_row::row_state(&app, row), account_row::RowState::Problem);
+        assert!(!account_row::row_view(&app, row).otp, "no code boxes: {refused}");
+        // Not retried, and nothing signs it in by itself until a sign-in works.
+        assert!(row.network_wait.is_none() && row.resign.is_none() && !app.presigned(&key), "{refused}");
+        let saved = load_settings(&app.config).unwrap();
+        assert!(!saved.account_otp.contains(&key) && !saved.account_no_otp.contains(&key), "saved as not yet seen signing in");
+        app.startup_signin_pending = true;
+        assert!(app.take_startup_signins().is_empty());
+        assert!(app.launches.as_ref().unwrap().is_empty(), "never a second login");
+        // The user's Play without a code works: known again to need none.
+        let row = &mut app.accounts[0];
+        (row.busy, row.launch_trigger, row.presign_login) = (true, Some(launch_timing::LaunchTrigger::Play), false);
+        app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+            pid: 41, detail: "Client started".into(), alive: Arc::new(AtomicBool::new(true)),
+            game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
+            outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
+        })));
+        assert!(app.settings.presigns(&key));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+}
+
 /// Review findings (2026-10-13): only a refused member login counts, and only of a sign-in
 /// Crystal started by itself. A failure of the network-level connection (before any password
 /// is sent: PlayOnline down for its own maintenance, unreachable), a cancelled login or an
@@ -4228,7 +4268,7 @@ fn a_refused_pre_sign_in_marks_the_account_otp_and_is_not_retried() {
 /// marks it.
 #[test]
 fn only_a_refused_member_login_of_crystals_own_sign_in_marks_the_account_otp() {
-    let refused = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+    let refused = "Game loader error during startup: Native PlayOnline member login failed (state -5311, POL result -5311). (Windower via crystal-loader).";
     for failure in ["Game loader error during startup: Native PlayOnline network connection failed (state -1025, POL result -1036). (Windower via crystal-loader).",
         "Game loader error during startup: Native PlayOnline login was cancelled at state -1 (POL result -1036). (Windower via crystal-loader).",
         "Game loader error during startup: Native PlayOnline login failed (state 39, POL result -1036). (Windower via crystal-loader)."] {
@@ -4269,7 +4309,7 @@ fn only_a_refused_member_login_of_crystals_own_sign_in_marks_the_account_otp() {
 /// account's own pre-sign-in marks it.
 #[test]
 fn a_batch_marks_only_the_refused_account_otp() {
-    let refused = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+    let refused = "Game loader error during startup: Native PlayOnline member login failed (state -5311, POL result -5311). (Windower via crystal-loader).";
     let (mut app, ready) = resign_app("batch-refused");
     let (refused_key, told) = (app.accounts[1].key.clone(), app.accounts[2].key.clone());
     app.settings.account_no_otp.extend([refused_key.clone(), told.clone()]);
@@ -4357,7 +4397,7 @@ fn an_authenticator_key_makes_an_otp_account_sign_in_by_itself() {
 #[test]
 fn a_refused_authenticator_code_falls_back_to_a_typed_code_and_is_not_retried() {
     i18n::set(i18n::Lang::En);
-    let refused = "Game loader error during startup: Native PlayOnline member login failed (state 39, POL result -1036). (Windower via crystal-loader).";
+    let refused = "Game loader error during startup: Native PlayOnline member login failed (state -5311, POL result -5311). (Windower via crystal-loader).";
     for trigger in [launch_timing::LaunchTrigger::StartupSignIn, launch_timing::LaunchTrigger::SignInAfterGame,
         launch_timing::LaunchTrigger::Play, launch_timing::LaunchTrigger::QueuedPlay] {
         let (mut app, key) = resign_app("authenticator-refused");
@@ -5144,4 +5184,52 @@ fn one_refused_account_does_not_stop_the_others() {
     assert!(app.accounts[1].problem && app.accounts.iter().enumerate().all(|(index, row)| index == 1 || !row.problem));
     assert_eq!(app.coordinated_keys(&left).len(), count - 1, "the others still go as one batch");
     std::fs::remove_dir_all(root).unwrap();
+}
+/// Live 2026-11-15 (test builds 7, 8): character select never started for an account with it
+/// on. Every Play path takes its plan from `play_plan` and sends one of these lines: a cold Play
+/// and a Recovery relaunch (the direct `session` line), a parked Play (the `park` line, then the
+/// Play's `credentials`), and a pre-sign-in whose session a later Play starts (its `session`
+/// line). Each carries the account's character select on, beside the Recovery flag. The cold
+/// lines must equal the fixture the loader's own parser reads back as on (crystal-loader
+/// proto.rs `the_launchers_play_lines_keep_character_select_on`).
+#[test]
+fn every_play_path_sends_character_select_to_the_loader() {
+    let root = std::env::temp_dir().join(format!("crystal-play-lines-{}", backend::unique_id().unwrap()));
+    let config = Config { experiment: root.clone(), repository: root.clone(), game_install: None, dat_overlays: Vec::new() };
+    let account = Account { label: "Synthetic".into(), mode: AccountMode::Retail, server: String::new(), pol_id: "ABCD1234".into(),
+        pol_password: "synthetic".into(), se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
+        launch_with: Some(backend::LaunchWith::Windower), ashita_boot_ini: None, windower_profile: None,
+        pol_handle_names: String::new(), totp_key: String::new() };
+    let on = pol_less::AutoLogin { enabled: true, character_slot: 2 };
+    let mut settings = Settings::default();
+    settings.account_auto_login.insert(account_key(&account), on);
+    let features = Some(features::Runtime::new(config.clone(), Arc::new(|_| {})));
+    features.as_ref().unwrap().update(|settings| settings.recovery.auto_relaunch = true).unwrap();
+    let fixture: Vec<serde_json::Value> = include_str!("../crystal-loader/tests/fixtures/launcher_play_lines.jsonl").lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    let (install, pol) = (Path::new(r"C:\Games\FFXI"), Path::new(r"C:\Games\PlayOnlineViewer"));
+    let expected = serde_json::json!({"enabled": true, "character_slot": 2});
+    for (path, social_only, trigger) in [("cold Play", false, launch_timing::LaunchTrigger::Play),
+        ("Recovery relaunch", false, launch_timing::LaunchTrigger::Play),
+        ("batch Play", false, launch_timing::LaunchTrigger::BatchPlay),
+        ("pre-sign-in for a later Play", true, launch_timing::LaunchTrigger::StartupSignIn)] {
+        // As start_launch and start_together set it up.
+        let mut plan = play_plan(&launch_tools::State::default(), &settings, &features, &account).unwrap();
+        (plan.social_only, plan.viewer_gaps, plan.trigger) = (social_only, social_only, trigger);
+        assert_eq!((plan.auto_login, plan.dismiss_disconnect), (on, true), "{path}");
+        let [mut session, park, mut credentials] = pol_less::play_lines_for_test(&config, &plan, &account, install, pol).unwrap();
+        assert_eq!((&session["auto_login"], &park["auto_login"]), (&expected, &expected), "{path}");
+        assert_eq!((&session["dismiss_disconnect"], &credentials["dismiss_disconnect"]), (&true.into(), &true.into()), "{path}");
+        if !social_only {
+            // The Viewer folder is this machine's; the credentials are the loader's own test's.
+            for line in [&mut session, &mut credentials] { line.as_object_mut().unwrap().remove("native_auth"); }
+            session.as_object_mut().unwrap().remove("pol_install_dir");
+            assert_eq!([session, park, credentials], fixture[..], "{path}");
+        }
+    }
+    // Without the features runtime the Recovery flag is off, and character select stays on.
+    let plan = play_plan(&launch_tools::State::default(), &settings, &None, &account).unwrap();
+    assert_eq!((plan.auto_login, plan.dismiss_disconnect), (on, false));
+    drop(features);
+    let _ = std::fs::remove_dir_all(&root);
 }

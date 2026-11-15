@@ -94,6 +94,19 @@ impl Layout {
     }
 }
 
+/// Where the game's controller FLAGS keep each `padmode000` field: enabled,
+/// rumble, sliders, hat, background, XInput.
+const MODE_FLAGS: [usize; 6] = [0, 5, 2, 1, 3, 4];
+
+/// Address of the game's live "keep working in the background" flag: the byte
+/// its pad frame tests before it asks XInput, whoever supplied `padmode000`
+/// (this session, the registry, a launch tool). None when this build's
+/// controller code is not recognized.
+pub(crate) fn background_flag() -> Option<usize> {
+    let layout = crate::game_layout::ffximain()?;
+    Some(layout.base + layout.controller.as_ref().ok()?.flags + MODE_FLAGS[4])
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Context { keyboard: usize, window: usize }
 
@@ -123,8 +136,7 @@ impl Expected {
     }
 
     fn matches(&self, flags: &[u8; 15], bindings: &[i8; 32], guid: &[u8; 16]) -> bool {
-        // Mode order: enabled, rumble, sliders, hat, background, XInput.
-        [0, 5, 2, 1, 3, 4].into_iter().enumerate().all(|(i, offset)| flags[offset] == self.mode[i])
+        MODE_FLAGS.into_iter().enumerate().all(|(i, offset)| flags[offset] == self.mode[i])
             && flags[12] == 0 && flags[14] == 0
             // Stock skips binding parsing while the pad is disabled. The
             // retained process-local string is read when it is enabled again.

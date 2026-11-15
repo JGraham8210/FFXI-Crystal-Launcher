@@ -61,6 +61,8 @@ pub(super) struct NativeAuth {
     /// session started as a pre-sign-in, never for a cold Play or a batch's sign-in.
     viewer_gaps: bool,
     keep_session: bool,
+    /// The session line's `dismiss_disconnect`: Recovery relaunches by itself.
+    dismiss_disconnect: bool,
     auto_away_minutes: u8,
     auto_login: super::AutoLogin,
     game_running: Arc<AtomicBool>,
@@ -142,7 +144,7 @@ impl NativeAuth {
             status: AtomicI32::new(0),
             social_only: false,
             start_pending: AtomicBool::new(false),
-            keep_session: false, viewer_gaps: false,
+            keep_session: false, viewer_gaps: false, dismiss_disconnect: false,
             auto_away_minutes: super::default_auto_away(),
             auto_login: super::AutoLogin::default(),
             game_running: Arc::new(AtomicBool::new(true)),
@@ -164,6 +166,7 @@ impl NativeAuth {
     }
     pub fn set_viewer_gaps(&mut self, gaps: bool) { self.viewer_gaps = gaps; }
     pub fn set_keep_session(&mut self, keep: bool) { self.keep_session = keep; }
+    pub fn set_dismiss_disconnect(&mut self, dismiss: bool) { self.dismiss_disconnect = dismiss; }
     /// 0 = off, else one of the Viewer's 10..60-minute choices.
     pub fn set_auto_away(&mut self, minutes: u8) {
         self.auto_away_minutes = if super::AUTO_AWAY_CHOICES.contains(&minutes) { minutes } else { super::default_auto_away() };
@@ -386,15 +389,15 @@ impl SignedIn for NativeAuth {
             None => "\"region\":\"US\",\"lang\":\"US\"".to_owned(),
             Some(values) => format!("\"region\":\"{0}\",\"lang\":\"{0}\",\"ucs_area\":\"{1}\"", values.region.wire(), values.ucs_area),
         };
-        let head=format!("{{\"type\":\"session\",\"v\":1,{region},\"start_game\":{},\"keep_session\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"auto_login\":{},\"pol_install_dir\":{},\"install_dir\":{},\"native_auth\":{{", !self.idle_first(), self.keep_session, self.viewer_gaps, self.auto_away_minutes, auto_login, pol, serde_json::to_string(install).map_err(|_| t("Could not encode the game folder."))?);
+        let head=format!("{{\"type\":\"session\",\"v\":1,{region},\"start_game\":{},\"keep_session\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"dismiss_disconnect\":{},\"auto_login\":{},\"pol_install_dir\":{},\"install_dir\":{},\"native_auth\":{{", !self.idle_first(), self.keep_session, self.viewer_gaps, self.auto_away_minutes, self.dismiss_disconnect, auto_login, pol, serde_json::to_string(install).map_err(|_| t("Could not encode the game folder."))?);
         self.line_with_credentials(head)
     }
     /// pol-spec 07d §1.2: what a parked host gets at Play instead of `session`: the per-Play
     /// flags and the credentials, nothing the `park` line already gave (region, folders,
     /// auto-login, FFXI settings). One use, like `session_line`.
     fn credentials_line(&self) -> Result<Zeroizing<Vec<u8>>, String> {
-        let head = format!("{{\"type\":\"credentials\",\"start_game\":{},\"keep_session\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"native_auth\":{{",
-            !self.idle_first(), self.keep_session, self.viewer_gaps, self.auto_away_minutes);
+        let head = format!("{{\"type\":\"credentials\",\"start_game\":{},\"keep_session\":{},\"viewer_gaps\":{},\"auto_away_minutes\":{},\"dismiss_disconnect\":{},\"native_auth\":{{",
+            !self.idle_first(), self.keep_session, self.viewer_gaps, self.auto_away_minutes, self.dismiss_disconnect);
         self.line_with_credentials(head)
     }
     fn receive_native_friends(&self, blob: &[u8], locations: Option<&[u8]>) -> Result<usize, String> {
@@ -791,7 +794,7 @@ mod tests {
                 snapshot: Mutex::new(Snapshot::default()),
                 control_errors: Mutex::new(BTreeMap::new()),
                 cache_dirty: AtomicBool::new(false),
-                status: AtomicI32::new(0), social_only: false, start_pending: AtomicBool::new(false), keep_session: false, viewer_gaps: false, auto_away_minutes: 10, auto_login: super::super::AutoLogin::default(), game_running: Arc::new(AtomicBool::new(true)),
+                status: AtomicI32::new(0), social_only: false, start_pending: AtomicBool::new(false), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, auto_away_minutes: 10, auto_login: super::super::AutoLogin::default(), game_running: Arc::new(AtomicBool::new(true)),
                 social_seen: AtomicBool::new(false), play_pending_sent: AtomicBool::new(false),
                 target: crate::retail_region::Target::Us,
             } }
@@ -1027,7 +1030,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(value["type"], "credentials");
         assert_eq!(value["native_auth"], session["native_auth"]);
-        for flag in ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes"] {
+        for flag in ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes", "dismiss_disconnect"] {
             assert_eq!(value[flag], session[flag], "{flag}");
         }
         for host in ["v", "region", "lang", "install_dir", "pol_install_dir", "auto_login", "ffxi_settings"] {
@@ -1053,11 +1056,31 @@ mod tests {
     }
 
     #[test]
+    fn both_session_lines_carry_the_disconnect_dismissal_from_the_plan() {
+        let directory = std::env::temp_dir().join(format!("crystal-dismiss-{}", backend::unique_id().unwrap()));
+        for dismiss in [false, true] {
+            for parked in [false, true] {
+                let plan = super::super::Plan { tool: super::super::Tool::Windower, settings: Default::default(), social_only: false,
+                    auto_away_minutes: 10, auto_login: Default::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: dismiss, trigger: Default::default() };
+                let mut auth = NativeAuth::new(&play_account(), Zeroizing::new(String::new()), directory.clone()).unwrap();
+                super::super::configure(&mut auth, &plan);
+                let line = if parked { auth.credentials_line() } else { auth.session_line(Path::new(r"C:\Games\FFXI")) }.unwrap();
+                let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                assert_eq!(value["dismiss_disconnect"], dismiss, "parked {parked}");
+            }
+        }
+        // A window process older than the field sends none: off.
+        let plan: super::super::Plan = serde_json::from_value(serde_json::json!({"tool": super::super::Tool::Windower, "settings": super::super::ToolSettings::default()})).unwrap();
+        assert!(!plan.dismiss_disconnect);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn only_a_pre_sign_in_asks_for_the_viewer_pauses() {
         let directory = std::env::temp_dir().join(format!("crystal-gaps-{}", backend::unique_id().unwrap()));
         for (social_only, gaps, expected) in [(true, true, true), (true, false, false), (false, true, false), (false, false, false)] {
             let plan = super::super::Plan { tool: super::super::Tool::Windower, settings: Default::default(), social_only,
-                auto_away_minutes: 10, auto_login: Default::default(), keep_session: false, viewer_gaps: gaps, trigger: Default::default() };
+                auto_away_minutes: 10, auto_login: Default::default(), keep_session: false, viewer_gaps: gaps, dismiss_disconnect: false, trigger: Default::default() };
             let mut auth = NativeAuth::new(&play_account(), Zeroizing::new(String::new()), directory.clone()).unwrap();
             super::super::configure(&mut auth, &plan);
             let value: serde_json::Value = serde_json::from_slice(&auth.session_line(Path::new(r"C:\Games\FFXI")).unwrap()).unwrap();

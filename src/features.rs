@@ -29,7 +29,7 @@ pub(crate) mod runtime;
 pub(crate) mod snap;
 pub(crate) mod store;
 pub(crate) mod ui;
-mod wiring;
+pub(crate) mod wiring;
 
 pub(crate) use runtime::{Event, Runtime};
 pub(crate) use store::FeatureSettings;

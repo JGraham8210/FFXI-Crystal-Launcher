@@ -23,6 +23,14 @@ pub(crate) const MAIN_STATE: usize = 0x88;
 pub(crate) const MAIN_STEP: usize = 0x0C;
 /// 100db170 RequestState rejects any larger state (cmp eax,0xCB; ja).
 const MAIN_STATE_MAX: u32 = 0xCB;
+/// 100daf56: each step stores the core's POL result (table slot 705) here;
+/// main copies a negative one to the error it shows (10012791).
+pub(crate) const MAIN_POL_RESULT: usize = 0xB8;
+/// The two states only the client's fatal-error handlers request: 0x0C for
+/// FFXI-3001/4001..4006 (10017f10), 0x15 for FFXI-2001..2100 (10017e40, the
+/// lost POL connection's 2001). Main then opens the "ok" dialog (10014ad0).
+pub(crate) const MAIN_STOP_ERROR: u32 = 0x0C;
+pub(crate) const MAIN_STOP_LOST: u32 = 0x15;
 pub(crate) const OP_CONNECT: u32 = 2;
 pub(crate) const OP_LOGIN: u32 = 3;
 pub(crate) const OP_CHARACTER_LIST: u32 = 4;
@@ -55,16 +63,18 @@ pub(crate) fn verified_lobby(layout: &Resolution) -> Result<Lobby, String> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Snapshot {
-    operation: u32,
+pub(crate) struct Snapshot {
+    pub(crate) operation: u32,
     socket_state: i32,
     socket_error: i32,
-    reply_state: i32,
-    lobby_error: i32,
-    protocol_error: i32,
+    pub(crate) reply_state: i32,
+    pub(crate) lobby_error: i32,
+    pub(crate) protocol_error: i32,
 }
 
-fn snapshot(base: usize, lobby_rva: usize) -> Option<Snapshot> {
+/// Only valid when the image's diagnostics group resolved: that group is what
+/// checks these field offsets against the game's own code.
+pub(crate) fn snapshot(base: usize, lobby_rva: usize) -> Option<Snapshot> {
     let lobby = read::<u32>(base + lobby_rva)? as usize;
     if lobby == 0 { return None; }
     let tcp = read::<u32>(lobby + LOBBY_TCP)? as usize;
@@ -106,6 +116,14 @@ fn network_step(base: usize, main_rva: usize) -> Option<(u32, u32)> {
     let state = read(main + MAIN_STATE)?;
     (state <= MAIN_STATE_MAX).then_some(())?;
     Some((state, read(main + MAIN_STEP)?))
+}
+
+/// The network manager's requested state and its last POL result. Valid only
+/// when the diagnostics group resolved (it checks both offsets).
+pub(crate) fn network(base: usize, main_rva: usize) -> Option<(u32, i32)> {
+    let (state, _) = network_step(base, main_rva)?;
+    let main = read::<u32>(base + main_rva)? as usize;
+    Some((state, read(main + MAIN_POL_RESULT)?))
 }
 
 /// Starts before GameStart and joins before game interfaces are released.

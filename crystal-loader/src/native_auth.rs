@@ -1407,9 +1407,12 @@ fn run_friend_observer(api: Api, stopping: mpsc::Receiver<()>, send: impl Fn(Str
     let mut portrait_probed = false;
     loop {
         let catalog = crate::native_social::CATALOG_ACCESS.lock().unwrap_or_else(|e| e.into_inner());
-        let connected = api.zero(838) == 3;
+        let state = api.zero(838);
+        let connected = state == 3;
         let connection_changed = health.replace(connected) != Some(connected);
         if connection_changed {
+            // The first sample is logged only when it is already down.
+            if !connected || own_presence.is_some() { log!("native POL connection {} (state {state})", if connected { "restored" } else { "lost" }); }
             send(format!("{{\"type\":\"native_pol_status\",\"code\":{}}}\n", if connected { 0 } else { SESSION_LOST }));
         }
         if connected {

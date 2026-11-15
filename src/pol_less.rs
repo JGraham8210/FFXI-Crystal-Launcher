@@ -103,6 +103,9 @@ pub(crate) struct Plan {
     /// Retain the authenticated native owner when FFXI returns normally.
     #[serde(default)]
     pub keep_session: bool,
+    /// Recovery relaunches by itself: the loader presses OK on the in-world disconnect dialog.
+    #[serde(default)]
+    pub dismiss_disconnect: bool,
     /// What started this launch, for the launch log's trigger line (pol-spec 07d §4.2).
     /// Older window processes send none: `Play`.
     #[serde(default)]
@@ -284,8 +287,22 @@ fn configure(auth: &mut native_auth::NativeAuth, plan: &Plan) {
     // Viewer pauses only where they cost nothing at Play: a pre-sign-in (07c §4).
     auth.set_viewer_gaps(plan.social_only && plan.viewer_gaps);
     auth.set_keep_session(plan.keep_session);
+    auth.set_dismiss_disconnect(plan.dismiss_disconnect);
     auth.set_auto_away(plan.auto_away_minutes);
     auth.set_auto_login(plan.auto_login);
+}
+
+/// The lines a Play with `plan` sends the loader, as JSON: the direct `session` line, and a
+/// parked host's `park` line and its Play's `credentials` line. Built by the launch's own
+/// sign-in (`native_auth_for`) and park line, never by hand.
+#[cfg(test)]
+pub(crate) fn play_lines_for_test(config: &Config, plan: &Plan, account: &Account, install_dir: &Path,
+    pol_install_dir: &Path) -> Result<[serde_json::Value; 3], String> {
+    let json = |bytes: &[u8]| serde_json::from_slice::<serde_json::Value>(bytes).map_err(|e| e.to_string());
+    let session = native_auth_for(config, plan, account, Zeroizing::default())?.session_line(install_dir)?;
+    let park = park::park_line(install_dir, Some(pol_install_dir), plan.auto_login, None)?;
+    let credentials = native_auth_for(config, plan, account, Zeroizing::default())?.credentials_line()?;
+    Ok([json(&session)?, json(&park)?, json(&credentials)?])
 }
 
 /// Everything resolved before sign-in.
@@ -614,6 +631,8 @@ pub(crate) struct SessionLog {
     native_failure: bool,
     /// The POL connection is down (`native_pol_status` < 0); a later 0 clears it.
     native_connection_lost: bool,
+    /// This game reported losing its connection in the world (`game_disconnected`).
+    game_disconnected: bool,
 }
 impl SessionLog {
     fn open(path: &Path) -> Result<Self, String> {
@@ -945,6 +964,7 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
             log.native_shutdown_returned = false;
             log.native_failure = false;
             log.native_connection_lost = false;
+            log.game_disconnected = false;
             log.line(&format!("Game started (GameStart called){}", pid.map_or(String::new(), |p| format!(", PID {p}"))));
             Step::Started
         }
@@ -1025,6 +1045,11 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
             log.line(&format!("FFXI returned {code}."));
             Step::Continue
         }
+        LoaderEvent::GameDisconnected { state, code } => {
+            log.game_disconnected = true;
+            log.line(&format!("FFXI lost its connection in the world (network state {state:#x}, POL result {code}); it ends after its dialog."));
+            Step::Continue
+        }
         LoaderEvent::NativeSignOutComplete(code) => {
             log.native_sign_out = code == 0;
             log.native_idle = true;
@@ -1036,13 +1061,17 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
         }
         LoaderEvent::Exit(code) => {
             log.line(&format!("Loader reported exit code {code}."));
-            Step::End(if log.native_sign_out && (code == 0 || code == -14 && log.native_shutdown_returned && !log.native_failure && !log.native_connection_lost) {
+            // A game that lost its connection ends through its dialog with an ordinary result.
+            Step::End(if log.game_disconnected {
+                LoaderEnd::Disconnected
+            } else if log.native_sign_out && (code == 0 || code == -14 && log.native_shutdown_returned && !log.native_failure && !log.native_connection_lost) {
                 LoaderEnd::SignedOut
             } else { LoaderEnd::Exit(code) })
         }
         LoaderEvent::Error(message) => {
             log.line(&format!("Loader reported an error: {message}"));
-            Step::End(LoaderEnd::Error(message))
+            // A retained host then loses its idle POL session too.
+            Step::End(if log.game_disconnected { LoaderEnd::Disconnected } else { LoaderEnd::Error(message) })
         }
         // Something the host could not provide (FFXIDB's settings protection on a build it
         // does not know, or whether dgVoodoo loaded): said in the history, and the game goes on.
@@ -1961,6 +1990,20 @@ mod tests {
         let notice = || LoaderEvent::Notice("FFXIDB minimap settings protection is off: this FFXIDB.dll is not a build Crystal has verified.".into());
         assert_eq!(end(vec![started(), notice(), returned(true), completed(0), LoaderEvent::Exit(-14)]), LoaderEnd::SignedOut);
         assert_eq!(end(vec![idle(), sign_out(0), notice(), completed(0), LoaderEvent::Exit(0)]), LoaderEnd::SignedOut);
+        // A game that lost its connection in the world ends as a disconnect, whatever FFXI
+        // returned after its dialog and whether or not the core still signed out.
+        let lost = || LoaderEvent::GameDisconnected { state: 0x15, code: -2059 };
+        let ended = |code| LoaderEvent::NativeGameEnded { code, game_returned: true, game_id: 1 };
+        for events in [
+            vec![started(), lost(), ended(0), completed(-2059), LoaderEvent::Exit(0)],
+            vec![started(), lost(), ended(0), completed(0), LoaderEvent::Exit(0)],
+            vec![started(), lost(), ended(-14), completed(0), LoaderEvent::Exit(-14)],
+            vec![started(), LoaderEvent::NativeStatus(-1025), lost(), ended(0), LoaderEvent::Exit(3)],
+            vec![started(), lost(), ended(0), LoaderEvent::Error("PlayOnline session ended (POL result -2059). Sign in again to reconnect.".into())],
+        ] { assert_eq!(end(events), LoaderEnd::Disconnected); }
+        // The next game in a retained host starts clean.
+        assert_eq!(end(vec![started(), lost(), ended(0), started(), returned(true), completed(0), LoaderEvent::Exit(-14)]), LoaderEnd::SignedOut);
+        assert_eq!(end(vec![started(), lost(), LoaderEvent::Closed]), LoaderEnd::Closed, "a host that vanished stays a crash");
     }
 
     /// Finding: when Windower's updater relaunched it, the profile guard must follow the
@@ -2680,7 +2723,7 @@ mod tests {
         };
         let plan = Plan {
             social_only: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
             tool: Tool::Ashita,
             settings: ToolSettings { ashita: dir.join("none").to_string_lossy().into_owned(), ..Default::default() },
         };
@@ -2690,7 +2733,7 @@ mod tests {
         fs::write(dir.join("Ashita-cli.exe"), b"").unwrap();
         let plan = Plan {
             social_only: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
             tool: Tool::Ashita,
             settings: ToolSettings {
                 ashita: dir.to_string_lossy().into_owned(),
@@ -2704,7 +2747,7 @@ mod tests {
         fs::write(dir.join("crystal-loader.exe"), b"").unwrap();
         let plan = Plan {
             social_only: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
             tool: Tool::Ashita,
             settings: ToolSettings {
                 ashita: dir.to_string_lossy().into_owned(),
@@ -2733,7 +2776,7 @@ mod tests {
             server: String::new(), pol_id: "ABCD1234".into(), pol_password: "synthetic".into(),
             se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
             launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() };
-        let plan = Plan { tool: Tool::Vanilla, social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
+        let plan = Plan { tool: Tool::Vanilla, social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
             settings: ToolSettings { loader: loader.to_string_lossy().into_owned(),
                 ashita: root.join("missing-ashita").to_string_lossy().into_owned(),
                 windower: root.join("missing-windower").to_string_lossy().into_owned(),
@@ -2798,7 +2841,7 @@ mod tests {
             se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
             launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() };
         let mut plan = Plan { tool: Tool::Windower, social_only: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger: Default::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
             settings: ToolSettings { loader: loader.to_string_lossy().into_owned(),
                 windower: windower.to_string_lossy().into_owned(), ..Default::default() } };
         for retained_menu in ["[640,480]", "not valid JSON"] {
@@ -3622,7 +3665,7 @@ mod tests {
 
     fn parked_plan(trigger: crate::launch_timing::LaunchTrigger) -> Plan {
         Plan { tool: Tool::Windower, settings: Default::default(), social_only: false, auto_away_minutes: 10,
-            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, trigger }
+            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger }
     }
 
     /// 07d §1.4, §5.2: the parked host gets only the `park` line until Play; at Play the
