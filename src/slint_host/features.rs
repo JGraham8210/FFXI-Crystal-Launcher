@@ -207,6 +207,7 @@ thread_local! {
 /// The window closed: the page's models go with it (nothing stays in the background), and so
 /// do a recording's keyboard hook and a tile being dragged.
 pub(super) fn forget() {
+    super::pad_hotkeys::forget();
     RECORDING.with(|cell| cell.borrow_mut().take());
     WINDOW.with(|cell| cell.borrow_mut().take());
     STATE.with(|cell| cell.borrow_mut().take());
@@ -255,12 +256,15 @@ fn note(text: &str) {
     RECORDING.with(|cell| { if let Ok(slot) = cell.try_borrow() { if let Some(recording) = slot.as_ref() { recording.note(text); } } });
 }
 
-/// Whether a hotkey field is recording.
-pub(super) fn recording() -> bool { RECORDING.with(|cell| cell.try_borrow().is_ok_and(|slot| slot.is_some())) }
+/// Whether a hotkey field (keyboard or controller) is recording.
+pub(super) fn recording() -> bool { keys_recording() || super::pad_hotkeys::recording() }
+
+fn keys_recording() -> bool { RECORDING.with(|cell| cell.try_borrow().is_ok_and(|slot| slot.is_some())) }
 
 /// The window lost the foreground: a recording stops.
 pub(super) fn window_left() {
-    if !recording() { return; }
+    super::pad_hotkeys::window_left();
+    if !keys_recording() { return; }
     note("stopped: the window is no longer in front");
     feature(Msg::HotkeyCancel);
 }
@@ -268,6 +272,7 @@ pub(super) fn window_left() {
 /// The pointer went down somewhere in the window, before the page hears of it. Once the page
 /// has (`pointer_settled`), a recording whose own field was not the one pressed stops.
 pub(super) fn pointer_pressed() {
+    super::pad_hotkeys::pointer_pressed();
     let recording = RECORDING.with(|cell| cell.try_borrow_mut().is_ok_and(|mut slot| slot.as_mut().map(|r| r.claimed = false).is_some()));
     if recording { let _ = slint::invoke_from_event_loop(pointer_settled); }
 }
@@ -280,7 +285,7 @@ fn pointer_settled() {
 }
 
 /// The field a target's hotkey is in.
-fn row_of(target: &Target, accounts: &[String]) -> Option<i32> {
+pub(super) fn row_of(target: &Target, accounts: &[String]) -> Option<i32> {
     match target {
         Target::Next => Some(0),
         Target::Previous => Some(1),
@@ -288,7 +293,7 @@ fn row_of(target: &Target, accounts: &[String]) -> Option<i32> {
     }
 }
 
-fn target_at(row: i32) -> Option<Target> {
+pub(super) fn target_at(row: i32) -> Option<Target> {
     match row {
         0 => Some(Target::Next),
         1 => Some(Target::Previous),
@@ -537,6 +542,7 @@ pub(super) fn wire(ui: &MainWindow) {
     g.on_tile_key(move |tile, text, shift, down| weak.upgrade().is_some_and(|ui| tile_key(&ui.global::<Features>(), tile, &text, shift, down)));
     g.on_forget(|i| { if let Some(id) = read(|s| s.layout_ids.get(index(i)?).cloned()) { feature(Msg::Forget(id)); } });
     WINDOW.with(|cell| *cell.borrow_mut() = Some(ui.as_weak()));
+    super::pad_hotkeys::wire(ui);
     g.on_hotkey_record(|row| { if let Some(target) = target_at(row) { feature(Msg::HotkeyRecord(target)); } });
     g.on_hotkey_pointer(|row| RECORDING.with(|cell| {
         if let Ok(mut slot) = cell.try_borrow_mut() { if let Some(recording) = slot.as_mut() { recording.claimed = recording.row == row; } }
@@ -624,6 +630,7 @@ pub(super) fn sync(ui: &MainWindow, app: &App) {
             state.accounts = app.accounts.iter().map(|row| row.key.clone()).collect();
         }
         record_sync(ui, &g, app, &state.accounts);
+        super::pad_hotkeys::sync(&g, app, &state.accounts);
         let view = &app.features_view;
         let inputs = Inputs {
             section: None,
@@ -699,6 +706,8 @@ fn strings() -> FeatureStrings {
         per_account: t("Per account").into(),
         hotkey_none: t("Not set").into(),
         hotkey_note: t("Click a hotkey, then press the keys. Esc cancels; Backspace clears it.").into(),
+        keyboard: t("Keyboard").into(),
+        controller: t("Controller").into(),
         no_accounts: t("No accounts yet").into(),
         recovery: t("Crash recovery").into(),
         offer: t("Offer Relaunch after a crash or disconnect").into(),
@@ -885,7 +894,7 @@ fn windows(g: &Features, app: &App, settings: &FeatureSettings, state: &mut Stat
         Tile {
             key: row.key.clone(),
             name: crate::privacy::mask(&row.account.label),
-            live: crate::account_row::row_state(app, row) == crate::account_row::RowState::Playing,
+            live: matches!(crate::account_row::row_state(app, row), crate::account_row::RowState::Playing | crate::account_row::RowState::ConnectionLost),
             open: window.is_some(),
             placed: place.is_some(),
             pending: pending.is_some(),
@@ -1164,7 +1173,8 @@ fn section_title(section: Section) -> &'static str {
 /// page from the layout and monitor chosen).
 fn section_notes(app: &App, settings: &FeatureSettings) -> Vec<String> {
     let hotkeys = &settings.hotkeys;
-    let set = usize::from(hotkeys.cycle.is_some()) + usize::from(hotkeys.cycle_back.is_some()) + hotkeys.accounts.len();
+    let set = usize::from(hotkeys.cycle.is_some()) + usize::from(hotkeys.cycle_back.is_some()) + hotkeys.accounts.len()
+        + usize::from(hotkeys.pad_cycle.is_some()) + usize::from(hotkeys.pad_cycle_back.is_some()) + hotkeys.pad_accounts.len();
     let recovery = &settings.recovery;
     let on_off = |on: bool| if on { t("on") } else { t("off") };
     Section::ALL.iter().map(|section| match section {
@@ -1219,6 +1229,7 @@ fn hotkey_line(name: String, hotkey: Option<Hotkey>, action: &Action, set: &[(St
         active: status.is_some_and(|s| s.problem.is_none() || (in_game && s.problem == Some(Problem::InUse))) && error.is_none(),
         problem: problem_text.into(),
         warn,
+        ..HotkeyLine::default()
     }
 }
 
@@ -1231,19 +1242,25 @@ fn hotkeys(app: &App, settings: &FeatureSettings, state: &mut State) {
     if let Some(hotkey) = settings.hotkeys.cycle { set.push((t("Next window").to_owned(), Action::Next, hotkey)); }
     if let Some(hotkey) = settings.hotkeys.cycle_back { set.push((t("Previous window").to_owned(), Action::Previous, hotkey)); }
     set.extend(app.accounts.iter().filter_map(|row| Some((label(row), Action::Account(row.key.clone()), *settings.hotkeys.accounts.get(&row.key)?))));
+    // Each row's controller field beside its keyboard one.
+    let facts = crate::features::pad_view::Facts::of(&app.gamepad);
+    let refused = app.features.as_ref().map(|r| r.pad_refused()).unwrap_or_default();
+    let with_pad = |mut line: HotkeyLine, chord, action: &Action| {
+        super::pad_hotkeys::decorate(&mut line, chord, action, &refused, &facts);
+        line
+    };
     let cycle = vec![
-        hotkey_line(in_game(t("Next window")), settings.hotkeys.cycle, &Action::Next, &set, view, errors.get("hotkey:next")),
-        hotkey_line(in_game(t("Previous window")), settings.hotkeys.cycle_back, &Action::Previous, &set, view, errors.get("hotkey:previous")),
+        with_pad(hotkey_line(in_game(t("Next window")), settings.hotkeys.cycle, &Action::Next, &set, view, errors.get("hotkey:next")),
+            settings.hotkeys.pad_cycle, &Action::Next),
+        with_pad(hotkey_line(in_game(t("Previous window")), settings.hotkeys.cycle_back, &Action::Previous, &set, view, errors.get("hotkey:previous")),
+            settings.hotkeys.pad_cycle_back, &Action::Previous),
     ];
     sync_model(&state.cycle_hotkeys, cycle);
-    let accounts = app.accounts.iter().map(|row| hotkey_line(
-        label(row),
-        settings.hotkeys.accounts.get(&row.key).copied(),
-        &Action::Account(row.key.clone()),
-        &set,
-        view,
-        errors.get(&format!("hotkey:{}", row.key)),
-    )).collect();
+    let accounts = app.accounts.iter().map(|row| {
+        let action = Action::Account(row.key.clone());
+        let line = hotkey_line(label(row), settings.hotkeys.accounts.get(&row.key).copied(), &action, &set, view, errors.get(&format!("hotkey:{}", row.key)));
+        with_pad(line, settings.hotkeys.pad_accounts.get(&row.key).copied(), &action)
+    }).collect();
     sync_model(&state.account_hotkeys, accounts);
 }
 
@@ -1384,6 +1401,8 @@ fn duration_text(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[path = "../../pad_hotkeys_tests.rs"]
+    mod pad_fields;
     use super::super::{pad, take_sent};
     use super::*;
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
@@ -1508,10 +1527,11 @@ mod tests {
         assert!(pad::modal_rect(ui.window()).is_none(), "the page is not modal");
         // The six section tiles, plus each section's own controls (the three presets and the
         // monitor they fill, a tile per account on the map, the three switches, two Forget
-        // buttons); the page lies right of the rail and under the top bar.
+        // buttons; a keyboard and a controller field per hotkey row); the page lies right of the
+        // rail and under the top bar.
         let own = [
             (Section::Windows, 3 + 1 + app.accounts.len() + 3 + 2),
-            (Section::Hotkeys, 2 + app.accounts.len()),
+            (Section::Hotkeys, 2 * (2 + app.accounts.len())),
             (Section::Recovery, 2),
             (Section::Backups, 3 + 1 + 2),
             (Section::Clients, 2 + 4 * app.accounts.len()),
@@ -2188,12 +2208,12 @@ mod tests {
         key(&ui, Key::Escape);
         assert!(matches!(pump(&mut app, &ui).as_slice(), [Message::Feature(Msg::HotkeyCancel)]));
         assert_eq!((g.get_recording(), cycle(&app), g.get_open()), (-1, before, true));
-        // Tab: cancelled, and the focus moves on to the next field.
+        // Tab: cancelled, and the focus moves on to the next field (the row's controller field).
         record(&mut app, &ui, &names[0]);
         key(&ui, Key::Tab);
         assert!(pump(&mut app, &ui).iter().all(|m| matches!(m, Message::Feature(Msg::HotkeyCancel))));
         assert_eq!((g.get_recording(), cycle(&app)), (-1, before));
-        assert_eq!(pad::focused(ui.window()).as_deref(), Some(names[1].as_str()));
+        assert_eq!(pad::focused(ui.window()), Some(format!("{} · {}", names[0], t("Controller"))));
         // The focus leaving (the controller's D-pad, a click on a field elsewhere).
         record(&mut app, &ui, &names[0]);
         assert!(pad::focus_named(ui.window(), &names[1]));

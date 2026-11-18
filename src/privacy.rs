@@ -110,11 +110,11 @@ pub(crate) fn split(text: &str, names: &[&str]) -> Vec<(String, bool)> {
 
 /// The Windows user folder (`C:\Users\<name>`), whose last part names the user.
 #[cfg(not(test))]
-fn profile_dir() -> Option<String> {
+pub(crate) fn profile_dir() -> Option<String> {
     std::env::var("USERPROFILE").ok().filter(|p| p.len() > 3)
 }
 #[cfg(test)]
-fn profile_dir() -> Option<String> {
+pub(crate) fn profile_dir() -> Option<String> {
     PROFILE.with(|p| p.borrow().clone())
 }
 #[cfg(test)]
@@ -123,7 +123,7 @@ pub(crate) fn set_profile_dir_for_test(dir: &str) {
 }
 
 /// The Windows user name, as it appears inside the user's paths.
-fn user_name() -> Option<String> {
+pub(crate) fn user_name() -> Option<String> {
     let dir = profile_dir()?;
     let name = dir.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next()?.to_owned();
     (name.len() > 1).then_some(name)

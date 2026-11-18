@@ -1,7 +1,9 @@
-//! One-shot, session-bound game shutdown. The graceful path uses no credentials,
-//! process termination, window activation or POL controls to stop the game. The
-//! instant path ("Close games instantly") ends only this session's own game host,
-//! by the exact process identity its worker recorded, like Windower's //terminate.
+//! One-shot, session-bound game shutdown. The graceful path asks the game: in the world its
+//! own /shutdown and countdown, on a fatal-error dialog its OK. Where the game cannot close
+//! itself (title screen, lobby, a dialog that did not end it, no answer) it falls back to the
+//! instant path. The instant path ("Close games instantly") ends only this session's own game
+//! host, by the exact process identity its worker recorded, like Windower's //terminate. An
+//! in-world character is never ended by itself: its row offers Close now instead.
 use super::*;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 
@@ -17,10 +19,47 @@ impl Mode {
     pub(crate) fn from_setting(instant: bool) -> Self {
         if instant { Self::Instant } else { Self::Graceful }
     }
-    pub(crate) fn run(self, session: &BackgroundSession) -> Result<(), String> {
+    pub(crate) fn run(self, session: &BackgroundSession) -> Result<(), Refusal> {
         match self {
             Self::Graceful => request(session),
-            Self::Instant => terminate(session),
+            Self::Instant => terminate(session).map_err(Refusal::from),
+        }
+    }
+}
+
+/// Why a shut-down did not end the game. `close_now`: the game accepted /shutdown in the world
+/// but is still open after CLOSE_LIMIT; only the user's Close now ends it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub message: String,
+    pub close_now: bool,
+}
+impl From<String> for Refusal {
+    fn from(message: String) -> Self { Self { message, close_now: false } }
+}
+impl From<&str> for Refusal {
+    fn from(message: &str) -> Self { message.to_owned().into() }
+}
+
+/// Which branch a current loader says answered a request (`path` / `reason`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Answer {
+    /// `/shutdown` ran in the world.
+    World,
+    /// OK was pressed on a fatal-error dialog.
+    Dialog,
+    /// Refused: no character in the world and no fatal dialog to answer.
+    NotInWorld,
+}
+impl Answer {
+    /// `None` from an older loader, or for a name this build does not know.
+    pub(crate) fn parse(ok: bool, path: Option<&str>, reason: Option<&str>) -> Option<Self> {
+        match (ok, path, reason) {
+            (true, Some("world"), _) => Some(Self::World),
+            (true, Some("dialog"), _) => Some(Self::Dialog),
+            (false, _, Some("not_in_world")) => Some(Self::NotInWorld),
+            _ => None,
         }
     }
 }
@@ -55,9 +94,24 @@ fn terminate_within(
     host_limit: Duration,
     worker_limit: Duration,
 ) -> Result<(), String> {
+    let directory = session.path.parent().ok_or(t("This game session has no account directory."))?;
+    let _delivery = exclusive(&directory.join("game-shutdown-delivery.lock"))
+        .map_err(|_| t("Shutdown is already being requested for this account."))?;
+    terminate_held(session, owned, host_limit, worker_limit)
+}
+
+/// The instant path's work, with the account's delivery lease already held (by
+/// `terminate_within`, or by the graceful path falling back to it).
+fn terminate_held(
+    session: &BackgroundSession,
+    owned: &dyn Fn(&OwnedHandle, Identity, Identity) -> bool,
+    host_limit: Duration,
+    worker_limit: Duration,
+) -> Result<(), String> {
     use crate::win::process::{created, open, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
     use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_TERMINATE};
     let refused = || t("Could not close FFXI.").to_owned();
+    // Refuses a parked or idle host with no game.
     current(session)?;
     let record = read_record(&session.path)
         .filter(|record| record.worker == session.worker)
@@ -66,8 +120,6 @@ fn terminate_within(
         return Err(t("Wait for FFXI to finish starting before requesting shutdown.").into());
     };
     let directory = session.path.parent().ok_or(t("This game session has no account directory."))?;
-    let _delivery = exclusive(&directory.join("game-shutdown-delivery.lock"))
-        .map_err(|_| t("Shutdown is already being requested for this account."))?;
     // One handle is checked and terminated: a reused PID can never be the one ended.
     let process = open(started.pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE)
         .map_err(|_| refused())?;
@@ -123,7 +175,43 @@ pub(crate) fn terminated(directory: &Path) -> bool {
 }
 
 const FRAME_LIMIT: usize = 2048;
+/// How long /shutdown in the world may take (the game's own countdown, then POL).
 const CLOSE_LIMIT: Duration = Duration::from_secs(90);
+/// How long a game whose fatal dialog got its OK may take to close before its host is ended.
+const DIALOG_CLOSE_LIMIT: Duration = Duration::from_secs(10);
+/// A reply in flight at the request's deadline still counts (loader → worker → file): the
+/// loader never runs /shutdown after the deadline, so no answer by then plus this means none.
+const REPLY_GRACE: Duration = Duration::from_secs(2);
+/// An older loader's refusal outside the world, before replies named their branch.
+const OLD_NOT_IN_WORLD: &str = "Log into a character before requesting shutdown from Crystal.";
+
+/// The graceful path's timings; the tests shorten them.
+#[derive(Clone, Copy)]
+struct Limits { ready: Duration, dispatch: Duration, close: Duration, dialog: Duration, grace: Duration }
+const LIMITS: Limits = Limits { ready: ONE_SHOT_READY_LIMIT, dispatch: ONE_SHOT_DISPATCH_LIMIT, close: CLOSE_LIMIT,
+    dialog: DIALOG_CLOSE_LIMIT, grace: REPLY_GRACE };
+
+/// What a request's reply means for the ladder.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// Wait this long for the game to close; then end the host (`true`) or offer Close now.
+    Wait(Duration, bool),
+    /// End the host now: the game cannot close itself on this screen.
+    End,
+    /// Stop with this message; the game stays as it is.
+    Fail(String),
+}
+fn next(ok: bool, answer: Option<Answer>, message: String, limits: Limits) -> Next {
+    match (ok, answer) {
+        (true, Some(Answer::Dialog)) => Next::Wait(limits.dialog, true),
+        // In the world, or an older loader's acceptance: never ended by itself.
+        (true, _) => Next::Wait(limits.close, false),
+        (false, Some(Answer::NotInWorld)) => Next::End,
+        (false, None) if message == OLD_NOT_IN_WORLD => Next::End,
+        (false, _) if message.is_empty() => Next::Fail(t("FFXI could not accept the shutdown request.").into()),
+        (false, _) => Next::Fail(message),
+    }
+}
 const UNSUPPORTED: &str = "Background shutdown is unavailable for this session. Close FFXI and launch it again with the current Crystal build.";
 
 struct ProcessWatch(std::os::windows::io::OwnedHandle);
@@ -167,6 +255,8 @@ struct Reply {
     game_id: u64,
     ok: bool,
     message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    answer: Option<Answer>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -236,15 +326,16 @@ impl Drop for Pending {
     }
 }
 
-pub(crate) fn request(session: &BackgroundSession) -> Result<(), String> {
-    request_within(session, ONE_SHOT_READY_LIMIT, ONE_SHOT_DISPATCH_LIMIT, CLOSE_LIMIT)
+pub(crate) fn request(session: &BackgroundSession) -> Result<(), Refusal> {
+    request_within(session, LIMITS, &|| terminate_held(session, &crystal_host, HOST_EXIT_LIMIT, WORKER_EXIT_LIMIT))
 }
+/// The graceful request, then the ladder: the game closes itself, or `end` (the instant path,
+/// under the lease this holds) ends a host that is not in the world, never one that is.
 fn request_within(
     session: &BackgroundSession,
-    ready_limit: Duration,
-    dispatch_limit: Duration,
-    close_limit: Duration,
-) -> Result<(), String> {
+    limits: Limits,
+    end: &dyn Fn() -> Result<(), String>,
+) -> Result<(), Refusal> {
     current(session)?;
     let record = read_record(&session.path)
         .filter(|record| record.worker == session.worker)
@@ -265,7 +356,7 @@ fn request_within(
     // must not repeat /shutdown and accidentally cancel the first countdown.
     let _delivery = exclusive(&directory.join("game-shutdown-delivery.lock"))
         .map_err(|_| t("Shutdown is already being requested for this account."))?;
-    let ready_until = Instant::now() + ready_limit;
+    let ready_until = Instant::now() + limits.ready;
     let game = loop {
         current(session)?;
         if let Some(ready) = reply(directory, session.worker, 0) {
@@ -281,7 +372,7 @@ fn request_within(
     };
     let id = one_shot_id().ok_or(t("Could not identify the shutdown request."))?;
     let deadline_ms = request_clock_ms()
-        .checked_add(dispatch_limit.min(ONE_SHOT_DISPATCH_LIMIT).as_millis() as u64)
+        .checked_add(limits.dispatch.min(ONE_SHOT_DISPATCH_LIMIT).as_millis() as u64)
         .ok_or(t("Could not time the shutdown request."))?;
     let _pending = Pending {
         directory: directory.into(),
@@ -306,33 +397,38 @@ fn request_within(
         )?;
     }
     wake::signal(session.worker);
-    let close_until = Instant::now() + close_limit;
-    let mut accepted = false;
+    // Both exact process identities must be gone, or the retained session's game ended. A new
+    // game or a reused PID is never touched, and a dispatch ACK is not a completed exit.
+    let closed = || -> Result<bool, String> {
+        Ok(host_watch.ended()? && worker_watch.ended()? || game_ended(directory, session.worker, game))
+    };
+    // The instant path; a game that closed meanwhile is done too.
+    let end_host = || -> Result<(), Refusal> {
+        end().or_else(|error| if closed()? { Ok(()) } else { Err(error.into()) })
+    };
+    let grace_ms = limits.grace.as_millis() as u64;
+    let mut waiting: Option<(Instant, bool)> = None;
     loop {
-        // Both exact process identities must be gone. A new game or a reused
-        // PID is never touched, and a dispatch ACK is not a completed exit.
-        if host_watch.ended()? && worker_watch.ended()? {
-            return Ok(());
-        }
-        if game_ended(directory, session.worker, game) { return Ok(()); }
-        if !accepted {
-            if let Some(result) =
-                reply(directory, session.worker, id).filter(|result| result.game_id == game)
-            {
-                if !result.ok {
-                    return Err(if result.message.is_empty() {
-                        t("FFXI could not accept the shutdown request.").into()
-                    } else {
-                        result.message
-                    });
+        if closed()? { return Ok(()); }
+        match waiting {
+            None => {
+                if let Some(result) = reply(directory, session.worker, id).filter(|result| result.game_id == game) {
+                    match next(result.ok, result.answer, result.message, limits) {
+                        Next::Wait(limit, then_end) => waiting = Some((Instant::now() + limit, then_end)),
+                        Next::End => return end_host(),
+                        Next::Fail(message) => return Err(message.into()),
+                    }
+                } else if request_clock_ms() >= deadline_ms.saturating_add(grace_ms) {
+                    // No answer: the game is not running its input frames (title, hung, gone).
+                    return end_host();
                 }
-                accepted = true;
-            } else if request_clock_ms() >= deadline_ms {
-                return Err(t("FFXI did not confirm the shutdown request in time. No game was forcibly closed.").into());
             }
-        }
-        if Instant::now() >= close_until {
-            return Err(t("FFXI or PlayOnline is still open. The game may have refused or cancelled shutdown; finish it in game, then retry.").into());
+            Some((until, true)) if Instant::now() >= until => return end_host(),
+            Some((until, false)) if Instant::now() >= until => return Err(Refusal {
+                message: t("FFXI or PlayOnline is still open. The game may have refused or cancelled shutdown; finish it in game, then retry.").into(),
+                close_now: true,
+            }),
+            Some(_) => {}
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -373,6 +469,7 @@ pub(crate) fn publish(
     game: u64,
     ok: bool,
     message: &str,
+    answer: Option<Answer>,
 ) -> Result<(), String> {
     if game == 0 || !one_shot_message_valid(message) {
         return Err("Invalid game shutdown result.".into());
@@ -398,361 +495,10 @@ pub(crate) fn publish(
             game_id: game,
             ok,
             message: message.into(),
+            answer,
         },
     )
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::process::{Child, Stdio};
-    fn fixture(root: &Path) -> (Config, Account, PathBuf) {
-        let config = Config {
-            experiment: root.into(),
-            repository: root.into(),
-            game_install: None,
-            dat_overlays: Vec::new(),
-        };
-        let mut account = crate::blank_account();
-        account.pol_id = "TEST0001".into();
-        let directory = config.account_directory(&account);
-        fs::create_dir_all(&directory).unwrap();
-        (config, account, directory)
-    }
-    struct Helper(Child);
-    impl Drop for Helper {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    struct Root(PathBuf);
-    impl Root {
-        fn new() -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "crystal-game-shutdown-{}",
-                crate::pol_less::pipe::random_hex().unwrap()
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-    impl Drop for Root {
-        fn drop(&mut self) {
-            assert!(self
-                .0
-                .canonicalize()
-                .unwrap()
-                .starts_with(std::env::temp_dir().canonicalize().unwrap()));
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    fn helper(root: &Path, role: &str, host: u32) -> Helper {
-        Helper(
-            Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "session_worker::game_shutdown::tests::game_shutdown_helper",
-                    "--ignored",
-                    "--nocapture",
-                ])
-                .env("CRYSTAL_TEST_SHUTDOWN_ROOT", root)
-                .env("CRYSTAL_TEST_SHUTDOWN_ROLE", role)
-                .env("CRYSTAL_TEST_SHUTDOWN_HOST", host.to_string())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .spawn()
-                .unwrap(),
-        )
-    }
-    fn wait_file(root: &Path, name: &str) {
-        let until = Instant::now() + Duration::from_secs(5);
-        while !root.join(name).exists() {
-            assert!(Instant::now() < until, "fixture milestone {name}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-    #[test]
-    #[ignore = "Child of the isolated shutdown protocol test; no game or credentials are loaded"]
-    fn game_shutdown_helper() {
-        let root = PathBuf::from(std::env::var_os("CRYSTAL_TEST_SHUTDOWN_ROOT").unwrap());
-        let role = std::env::var("CRYSTAL_TEST_SHUTDOWN_ROLE").unwrap();
-        if role == "host" {
-            wait_file(&root, "close-host");
-            return;
-        }
-        assert_eq!(role, "worker");
-        let (config, account, directory) = fixture(&root);
-        let worker = identity(std::process::id()).unwrap();
-        let host = std::env::var("CRYSTAL_TEST_SHUTDOWN_HOST")
-            .unwrap()
-            .parse()
-            .unwrap();
-        save_record(
-            &record_path(&config, &account),
-            &Record {
-                worker,
-                state: Event::Started(Started {
-                    pid: host,
-                    detail: "fixture".into(),
-                    log: root.join("fixture.log"),
-                    timing: String::new(),
-                }),
-                social_only: false,
-                authenticated: true,
-                native_batch: false,
-                otp_used: Some(false),
-                launch_choice: None, launch_tool: Some(Tool::Vanilla),
-            },
-        )
-        .unwrap();
-        publish_friends(
-            &directory,
-            &crate::friends::Snapshot {
-                game_running: Some(true),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        publish(&directory, 0, 7, true, "").unwrap();
-        fs::write(root.join("ready"), b"").unwrap();
-        if root.join("terminate").exists() {
-            // As the worker's supervisor, once the loader pipe closes: how did the game end?
-            let until = Instant::now() + Duration::from_secs(10);
-            while !(directory.join(TERMINATE_FILE).exists() && identity(host).is_none()) {
-                assert!(Instant::now() < until, "the host was not ended");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let kind = if terminated(&directory) { "normal" } else { "unknown" };
-            fs::write(root.join("classified"), kind).unwrap();
-            return;
-        }
-        let until = Instant::now() + Duration::from_secs(5);
-        let frame = loop {
-            if let Some(frame) = take(&directory) {
-                break frame;
-            }
-            assert!(Instant::now() < until);
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        let frame: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-        assert_eq!(frame["type"], "game_shutdown");
-        assert_eq!(frame["game_id"], 7);
-        assert!(frame.get("command").is_none());
-        assert!(take(&directory).is_none());
-        publish(
-            &directory,
-            frame["request_id"].as_u64().unwrap(),
-            7,
-            true,
-            "Requested",
-        )
-        .unwrap();
-        fs::write(root.join("dispatched"), b"").unwrap();
-        if root.join("retain-pol").exists() {
-            wait_file(&root, "end-game");
-            ended(&directory, 7).unwrap();
-        }
-        wait_file(&root, "close-worker");
-    }
-    #[test]
-    fn instant_close_ends_only_the_verified_host_and_its_worker_records_a_normal_close() {
-        let root = Root::new();
-        fs::write(root.0.join("terminate"), b"").unwrap();
-        let mut host = helper(&root.0, "host", 0);
-        let mut worker = helper(&root.0, "worker", host.0.id());
-        wait_file(&root.0, "ready");
-        let (config, account, directory) = fixture(&root.0);
-        let session = find(&config, &account).unwrap();
-        // The real check refuses a process that is not a pol.exe started after the worker.
-        assert!(terminate(&session).unwrap_err().contains("Could not close FFXI"));
-        assert!(host.0.try_wait().unwrap().is_none() && !directory.join(TERMINATE_FILE).exists());
-        let (host_pid, owner) = (host.0.id(), session.worker);
-        terminate_within(&session, &|_, found, worker| found.pid == host_pid && worker == owner,
-            Duration::from_secs(5), Duration::from_secs(5)).unwrap();
-        assert!(host.0.try_wait().unwrap().is_some(), "the host was ended");
-        assert!(worker.0.wait().unwrap().success());
-        assert_eq!(fs::read_to_string(root.0.join("classified")).unwrap(), "normal");
-        assert!(!directory.join(TERMINATE_FILE).exists() && !terminated(&directory), "consumed once");
-    }
-    #[test]
-    fn a_terminate_marker_for_another_worker_or_host_is_not_a_normal_close() {
-        let root = Root::new();
-        let (config, account, directory) = fixture(&root.0);
-        let worker = identity(std::process::id()).unwrap();
-        let started = |pid| Record {
-            worker,
-            state: Event::Started(Started { pid, detail: "fixture".into(), log: root.0.join("fixture.log"), timing: String::new() }),
-            social_only: false, authenticated: true, native_batch: false, otp_used: Some(false),
-            launch_choice: None, launch_tool: None,
-        };
-        save_record(&record_path(&config, &account), &started(worker.pid)).unwrap();
-        let other = Identity { created: worker.created.wrapping_add(1), ..worker };
-        for marker in [Terminate { worker: other, host: worker }, Terminate { worker, host: Identity { pid: worker.pid + 4, ..worker } }] {
-            save_json(&directory.join(TERMINATE_FILE), &marker).unwrap();
-            assert!(!terminated(&directory));
-            assert!(directory.join(TERMINATE_FILE).exists(), "a foreign marker is left alone");
-        }
-        save_json(&directory.join(TERMINATE_FILE), &Terminate { worker, host: worker }).unwrap();
-        assert!(terminated(&directory) && !terminated(&directory));
-        let report = crate::launch_log::classify_loader_end(&crate::launch_log::LoaderEnd::Terminated, Duration::from_secs(1));
-        assert_eq!(report.kind, crate::launch_log::ExitKind::Normal);
-        assert_eq!(report.summary, "Game closed normally");
-    }
-    #[test]
-    fn retained_pol_completes_shutdown_only_for_the_ended_game_and_keeps_both_processes_alive() {
-        let root = Root::new();
-        fs::write(root.0.join("retain-pol"), b"").unwrap();
-        let mut host = helper(&root.0, "host", 0);
-        let mut worker = helper(&root.0, "worker", host.0.id());
-        wait_file(&root.0, "ready");
-        let (config, account, directory) = fixture(&root.0);
-        let session = find(&config, &account).unwrap();
-        let captured = session.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || tx.send(request_within(&captured,
-            Duration::from_secs(1), Duration::from_secs(2), Duration::from_secs(4))).unwrap());
-        wait_file(&root.0, "dispatched");
-        for marker in [
-            Ended { worker: Identity { created: session.worker.created.wrapping_add(1), ..session.worker }, game_id: 7 },
-            Ended { worker: session.worker, game_id: 6 },
-        ] {
-            save_json(&directory.join("game-shutdown-ended.json"), &marker).unwrap();
-            assert!(rx.recv_timeout(Duration::from_millis(75)).is_err(), "neither an ACK nor a stale marker completes shutdown");
-        }
-        fs::write(root.0.join("end-game"), b"").unwrap();
-        rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-        thread.join().unwrap();
-        assert!(host.0.try_wait().unwrap().is_none() && worker.0.try_wait().unwrap().is_none());
-        assert!(!game_ended(&directory, session.worker, 8), "an older game cannot complete a later request");
-        fs::write(root.0.join("close-host"), b"").unwrap();
-        fs::write(root.0.join("close-worker"), b"").unwrap();
-        assert!(host.0.wait().unwrap().success() && worker.0.wait().unwrap().success());
-    }
-    #[test]
-    fn game_shutdown_ack_waits_for_both_processes_and_rejects_an_overlapping_request() {
-        let root = Root::new();
-        let mut host = helper(&root.0, "host", 0);
-        let mut worker = helper(&root.0, "worker", host.0.id());
-        wait_file(&root.0, "ready");
-        let (config, account, _) = fixture(&root.0);
-        let session = find(&config, &account).unwrap();
-        let captured = session.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let request_thread = std::thread::spawn(move || {
-            tx.send(request_within(
-                &captured,
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(4),
-            ))
-            .unwrap()
-        });
-        wait_file(&root.0, "dispatched");
-        assert!(rx.try_recv().is_err(), "an ACK is not a completed exit");
-        assert!(request_within(
-            &session,
-            Duration::from_millis(10),
-            Duration::from_millis(20),
-            Duration::from_millis(20)
-        )
-        .unwrap_err()
-        .contains("already"));
-        fs::write(root.0.join("close-host"), b"").unwrap();
-        assert!(host.0.wait().unwrap().success());
-        assert!(
-            rx.recv_timeout(Duration::from_millis(75)).is_err(),
-            "POL's owner must finish too"
-        );
-        fs::write(root.0.join("close-worker"), b"").unwrap();
-        assert!(worker.0.wait().unwrap().success());
-        rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-        request_thread.join().unwrap();
-    }
-    #[test]
-    fn game_shutdown_timeout_leaves_both_processes_alive() {
-        let root = Root::new();
-        let mut host = helper(&root.0, "host", 0);
-        let mut worker = helper(&root.0, "worker", host.0.id());
-        wait_file(&root.0, "ready");
-        let (config, account, _) = fixture(&root.0);
-        let session = find(&config, &account).unwrap();
-        let error = request_within(
-            &session,
-            Duration::from_secs(1),
-            Duration::from_secs(1),
-            Duration::from_millis(150),
-        )
-        .unwrap_err();
-        assert!(error.contains("still open"));
-        assert!(host.0.try_wait().unwrap().is_none() && worker.0.try_wait().unwrap().is_none());
-        fs::write(root.0.join("close-host"), b"").unwrap();
-        fs::write(root.0.join("close-worker"), b"").unwrap();
-        assert!(host.0.wait().unwrap().success());
-        assert!(worker.0.wait().unwrap().success());
-    }
-    #[test]
-    fn game_shutdown_never_consumes_a_foreign_or_expired_game_request() {
-        let root = Root::new();
-        let (config, account, directory) = fixture(&root.0);
-        let worker = identity(std::process::id()).unwrap();
-        save_record(
-            &record_path(&config, &account),
-            &Record {
-                worker,
-                state: Event::Started(Started {
-                    pid: worker.pid,
-                    detail: "fixture".into(),
-                    log: root.0.join("fixture.log"),
-                    timing: String::new(),
-                }),
-                social_only: false,
-                authenticated: true,
-                native_batch: false,
-                otp_used: Some(false),
-                launch_choice: None, launch_tool: None,
-            },
-        )
-        .unwrap();
-        publish_friends(
-            &directory,
-            &crate::friends::Snapshot {
-                game_running: Some(true),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        publish(&directory, 0, 7, true, "").unwrap();
-        for (owner, game, deadline) in [
-            (worker, 8, request_clock_ms() + 1000),
-            (worker, 7, request_clock_ms()),
-            (
-                Identity {
-                    created: worker.created + 1,
-                    ..worker
-                },
-                7,
-                request_clock_ms() + 1000,
-            ),
-        ] {
-            let path = directory.join("game-shutdown.json");
-            save_json(
-                &path,
-                &Request {
-                    worker: owner,
-                    request_id: 1,
-                    game_id: game,
-                    deadline_ms: deadline,
-                },
-            )
-            .unwrap();
-            assert!(take(&directory).is_none());
-            assert_eq!(
-                path.exists(),
-                owner != worker,
-                "another worker's file is preserved"
-            );
-        }
-    }
-}
+mod tests;

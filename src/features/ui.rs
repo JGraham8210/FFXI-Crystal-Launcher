@@ -106,6 +106,8 @@ pub(crate) enum Msg {
     HotkeyRecord(Target),
     HotkeyCancel,
     Hotkey(Target, Option<Hotkey>),
+    /// The controller's fields beside them (`pad_view`).
+    Pad(super::pad_view::PadMsg),
     // Crash recovery.
     Offer(bool),
     AutoRelaunch(bool),
@@ -149,6 +151,8 @@ pub(crate) struct State {
     pub hotkeys: Vec<hotkeys::Status>,
     /// The hotkey field that is recording.
     pub recording: Option<Target>,
+    /// The controller field that is recording.
+    pub pad_recording: Option<Target>,
     /// The in-game chords another program has registered, as last asked (`in_game_taken`).
     pub hotkeys_taken: Vec<Hotkey>,
     /// Ended games recovery offers a relaunch for, until played or dismissed.
@@ -366,8 +370,8 @@ impl App {
         let Some(runtime) = self.features.clone() else {
             // Previews and tests have no runtime: only the sheet's own state changes.
             match msg {
-                Msg::Open(open) => { self.features_view.open = open; self.features_view.recording = None; }
-                Msg::Section(section) => { self.features_view.section = section; self.features_view.recording = None; }
+                Msg::Open(open) => { self.features_view.open = open; self.features_view.recording = None; self.features_view.pad_recording = None; }
+                Msg::Section(section) => { self.features_view.section = section; self.features_view.recording = None; self.features_view.pad_recording = None; }
                 _ => {}
             }
             return Effect::none();
@@ -386,6 +390,7 @@ impl App {
                 view.open = open;
                 view.confirm_restore = None;
                 view.recording = None;
+                view.pad_recording = None;
                 if open {
                     view.notice = None;
                     view.field_errors.clear();
@@ -399,6 +404,7 @@ impl App {
             Msg::Section(section) => {
                 view.section = section;
                 view.recording = None;
+                view.pad_recording = None;
                 if section == Section::Windows {
                     view.monitors = runtime.monitors();
                     view.pending.retain(|account, _| runtime.has_window(account));
@@ -467,7 +473,9 @@ impl App {
             Msg::HotkeyRecord(target) => {
                 view.field_errors.remove(&target.id());
                 view.recording = Some(target);
+                view.pad_recording = None;
             }
+            Msg::Pad(msg) => super::pad_view::update(&runtime, view, msg),
             Msg::HotkeyCancel => view.recording = None,
             Msg::Hotkey(target, hotkey) => {
                 let id = target.id();

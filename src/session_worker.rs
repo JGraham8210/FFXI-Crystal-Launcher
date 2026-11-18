@@ -3,6 +3,7 @@
 //! Closing the window retires idle sessions; running games keep their own workers.
 
 pub(crate) mod game_shutdown;
+pub(crate) mod pad_hide;
 
 use crate::{
     backend::{self, Account, Config, LaunchResult},
@@ -179,15 +180,10 @@ pub(crate) const WINDOWER_TURN_LIMIT: Duration = Duration::from_secs(90);
 /// connect and hello limits, so a turn only ends early when a holder is stuck.
 pub(crate) const ASHITA_TURN_LIMIT: Duration = Duration::from_secs(90);
 
+/// `Runtime\locks`, the folder the game host resolves too (`storage::names::locks`). A test
+/// build never shares the user's locks.
 fn locks_directory() -> Result<PathBuf, String> {
-    // A test build never shares the user's locks (`backend::local_app_data`).
-    #[cfg(test)]
-    let local = Some(crate::backend::local_app_data().into_os_string());
-    #[cfg(not(test))]
-    let local = std::env::var_os("LOCALAPPDATA");
-    let root = std::env::var_os("CRYSTAL_DATA_ROOT").or(local)
-        .ok_or(t("Could not locate the Windower launch lock directory."))?;
-    Ok(PathBuf::from(root).join("Crystal Launcher/locks"))
+    Ok(crate::storage::Layout::current().locks())
 }
 
 /// The machine-wide Windower launch lock file (`windower_turn_at`).
@@ -1502,18 +1498,19 @@ fn monitor(
     path: PathBuf,
     worker: Identity,
     alive: std::sync::Weak<AtomicBool>,
-    game_running: std::sync::Weak<AtomicBool>,
+    (game_running, connection_lost): (std::sync::Weak<AtomicBool>, std::sync::Weak<AtomicBool>),
     outcome: std::sync::Weak<Mutex<Option<ExitReport>>>,
 ) {
     let mut previous_friends = None;
     loop {
-        // `alive` is what every holder watches; the other two may be dropped earlier.
+        // `alive` is what every holder watches; the others may be dropped earlier.
         let Some(alive) = alive.upgrade() else { return };
         let (game_running, outcome) = (game_running.upgrade(), outcome.upgrade());
         let modified = path.parent().and_then(|d| fs::metadata(d.join("friends.json")).ok()).and_then(|m| m.modified().ok());
         if modified != previous_friends {
             if let Some(snapshot) = path.parent().and_then(|d| read_friend_cache(d, worker)) {
                 if let (Some(game), Some(running)) = (snapshot.game_running, &game_running) { running.store(game, Ordering::Release); }
+                if let Some(lost) = connection_lost.upgrade() { lost.store(snapshot.connection_lost, Ordering::Release); }
                 previous_friends = modified;
             }
         }
@@ -1536,9 +1533,12 @@ fn monitor(
 
 fn track(path: PathBuf, worker: Identity, started: Started) -> Result<LaunchResult, String> {
     let alive = Arc::new(AtomicBool::new(true));
-    let game_running = Arc::new(AtomicBool::new(path.parent().and_then(|d| read_friend_cache(d, worker)).and_then(|s| s.game_running).unwrap_or(true)));
+    let cached = path.parent().and_then(|d| read_friend_cache(d, worker));
+    let game_running = Arc::new(AtomicBool::new(cached.as_ref().and_then(|s| s.game_running).unwrap_or(true)));
+    let connection_lost = Arc::new(AtomicBool::new(cached.is_some_and(|s| s.connection_lost)));
     let outcome = Arc::new(Mutex::new(None));
-    let (tracked, ended, game) = (Arc::downgrade(&alive), Arc::downgrade(&outcome), Arc::downgrade(&game_running));
+    let (tracked, ended) = (Arc::downgrade(&alive), Arc::downgrade(&outcome));
+    let game = (Arc::downgrade(&game_running), Arc::downgrade(&connection_lost));
     std::thread::Builder::new()
         .name("session-status".into())
         .spawn(move || monitor(path, worker, tracked, game, ended))
@@ -1550,6 +1550,7 @@ fn track(path: PathBuf, worker: Identity, started: Started) -> Result<LaunchResu
         timing: started.timing,
         alive,
         game_running,
+        connection_lost,
         outcome,
     })
 }
@@ -2359,7 +2360,7 @@ mod tests {
             social_only: true, authenticated: true, native_batch: true, otp_used: Some(false), launch_choice: None, launch_tool: Some(Tool::Windower) }).unwrap();
         let original = fs::read(&path).unwrap();
         let plan = Plan { tool: Tool::Vanilla, settings: Default::default(),
-            social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
+            social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0 };
         let error = launch_command(Command::new("must-not-spawn.exe"), &config, account.clone(), Zeroizing::default(),
             Some(plan), Instant::now(), |_| panic!("must stop before reconnect")).err().unwrap();
         assert!(error.contains("before switching launch methods"), "{error}");
@@ -2888,7 +2889,7 @@ mod tests {
             {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Ok(LaunchResult {
+            Ok(LaunchResult { connection_lost: Default::default(),
                 pid: std::process::id(),
                 detail: "Fixture started".into(),
                 log: config.experiment.join("fixture.log"),
@@ -2936,7 +2937,7 @@ mod tests {
                 while !root.join("stop").exists() { std::thread::sleep(Duration::from_millis(20)); }
                 tracked.store(false, Ordering::Release);
             });
-            Ok(LaunchResult { pid: std::process::id(), detail: "Fixture parked start".into(), log: config.experiment.join("fixture.log"),
+            Ok(LaunchResult { connection_lost: Default::default(), pid: std::process::id(), detail: "Fixture parked start".into(), log: config.experiment.join("fixture.log"),
                 timing: String::new(), alive, game_running: Arc::new(AtomicBool::new(false)), outcome: Arc::new(Mutex::new(None)) })
         }
     }
@@ -2996,7 +2997,7 @@ mod tests {
 
     fn park_plan() -> Plan {
         Plan { tool: Tool::Windower, settings: Default::default(), social_only: false, auto_away_minutes: 10,
-            auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() }
+            auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0 }
     }
 
     fn play_request(config: &Config, account: Account, trigger: crate::launch_timing::LaunchTrigger) -> Request {
@@ -3216,7 +3217,7 @@ mod tests {
             let config = config(&fixture.0);
             let plan = Plan { tool, settings: Default::default(), social_only: true,
                 auto_away_minutes: 0, auto_login: Default::default(),
-                keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
+                keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0 };
             let started = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
                 &config, account.clone(), Zeroizing::default(), Some(plan), Instant::now(), |_| {}).unwrap();
             (config, started)
@@ -3295,7 +3296,7 @@ mod tests {
         let account = account();
         let plan = |tool| Plan { tool, settings: Default::default(), social_only: true,
             auto_away_minutes: 0, auto_login: Default::default(),
-            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
+            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0 };
         let first = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
             &config, account.clone(), Zeroizing::default(), Some(plan(Tool::Vanilla)), Instant::now(), |_| {}).unwrap();
         let session = find(&config, &account).unwrap();
@@ -3321,7 +3322,7 @@ mod tests {
         let waiter = std::thread::spawn(move || close_idle_sessions(vec![pending]));
         let plan = Plan { tool: Tool::Vanilla, settings: Default::default(), social_only: true,
             auto_away_minutes: 0, auto_login: Default::default(),
-            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
+            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0 };
         let launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
             &config, account, Zeroizing::default(), Some(plan), Instant::now(), |_| {}).unwrap();
         waiter.join().unwrap().unwrap();
@@ -3373,7 +3374,7 @@ mod tests {
         let account = account();
         let plan = Plan { tool: Tool::Windower, settings: Default::default(), social_only: true,
             auto_away_minutes: 0, auto_login: Default::default(),
-            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() };
+            keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0 };
         let _launch = launch_command(child_command("session_worker::tests::worker_fixture", &fixture.0),
             &config, account.clone(), Zeroizing::default(), Some(plan), Instant::now(), |_| {}).unwrap();
         let session = find(&config, &account).unwrap();
@@ -3533,7 +3534,7 @@ mod tests {
         assert!(windower_turn_at(&windower, &mut |_| panic!("Windower has its own turn"), &|| None, Duration::from_millis(100)).is_ok());
         drop(held);
         assert!(ashita_turn_at(&ashita, &mut |_| {}, &|| None, Duration::from_millis(100)).is_ok());
-        assert!(ashita_lock_path().unwrap().ends_with("Crystal Launcher/locks/ashita.lock"));
+        assert!(ashita_lock_path().unwrap().ends_with("Runtime/locks/ashita.lock"));
     }
 
     /// Audit 2026-11-09: closing during a sign-in that failed before any worker was seen
@@ -3593,7 +3594,7 @@ mod tests {
         let (weak_alive, weak_game, weak_outcome) = (Arc::downgrade(&alive), Arc::downgrade(&game), Arc::downgrade(&outcome));
         drop((alive, game, outcome));
         let path = fixture.0.join("session.json");
-        let monitor = std::thread::spawn(move || monitor(path, worker, weak_alive, weak_game, weak_outcome));
+        let monitor = std::thread::spawn(move || monitor(path, worker, weak_alive, (weak_game, std::sync::Weak::new()), weak_outcome));
         until(|| monitor.is_finished());
     }
 

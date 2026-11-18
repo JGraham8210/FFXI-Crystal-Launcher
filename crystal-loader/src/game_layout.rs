@@ -81,6 +81,9 @@ pub(crate) struct Friends {
     pub display_area: usize,
     pub area_fn: usize,
     pub own_zone: usize,
+    /// The field of [own_zone]'s object holding my zone, taken from the
+    /// display's own compare (two sites, three with the other list).
+    pub own_zone_field: usize,
     pub group_table: usize,
     pub legacy_table: usize,
     pub area: Group,
@@ -155,6 +158,7 @@ const FRIENDS: Friends = Friends {
     display_area: 0x1E_AF22,
     area_fn: 0x1C_BC10,
     own_zone: 0x4D_FD98,
+    own_zone_field: 0x3_C350,
     group_table: 0x37_1DA8,
     legacy_table: 0x57_8548,
     area: Group { id: 4, entry: 21, object: 0x57_85F8 },
@@ -780,8 +784,10 @@ fn friends(c: &Ctx, lobby: Option<&Lobby>) -> Found<Friends> {
     // My own zone, compared before an area name is shown.
     let own_zone = c.abs(area + 0x1F)?;
     c.global("OWN_ZONE", own_zone)?;
+    // Derived, not compared with a constant: it moved (0x3c350 -> 0x3c400)
+    // in 6AE818B4. Both display branches must agree, and the other list too.
     let field = agree("own zone field", &[c.dword(area + 0x2D)?, c.dword(visible_area + 9)?])?;
-    expect("own zone field", field, f::OWN_ZONE_FIELD)?;
+    field.is_multiple_of(4).then_some(()).ok_or_else(|| format!("own zone field {field:#x} is not dword-aligned"))?;
     let area_fn = c.unique("friend.area_fn")?;
     expect("display area call", c.call(area + 0x43)?, area_fn)?;
     expect("display area call", c.call(visible_area + 0x1F)?, area_fn)?;
@@ -933,6 +939,7 @@ fn friends(c: &Ctx, lobby: Option<&Lobby>) -> Found<Friends> {
         display_area: area,
         area_fn,
         own_zone,
+        own_zone_field: field,
         group_table: table,
         legacy_table: legacy,
         area: area_res,
@@ -1425,11 +1432,36 @@ mod tests {
         fails(base, "input.key_down: more than one match", |k| k.text.copy_within(0x100..0x135, 0x600));
     }
 
+    /// `FFXiMain-<stamp>.img` (a live dump) or `.static.img` (a static unpack
+    /// at the preferred base) from CRYSTAL_FFXIMAIN_DUMPS.
     fn dump(timestamp: &str) -> Option<Vec<u8>> {
-        let path = std::env::var_os("CRYSTAL_FFXIMAIN_DUMPS")
-            .map(std::path::PathBuf::from)?
-            .join(format!("FFXiMain-{timestamp}.img"));
-        std::fs::read(&path).ok()
+        let dir = std::env::var_os("CRYSTAL_FFXIMAIN_DUMPS").map(std::path::PathBuf::from)?;
+        ["img", "static.img"].iter().find_map(|ext| std::fs::read(dir.join(format!("FFXiMain-{timestamp}.{ext}"))).ok())
+    }
+
+    /// The 2026-11 build (6AE818B4) moved the own-zone field; it is derived
+    /// from the display's own compares, and disagreeing compares refuse.
+    #[test]
+    #[ignore = "reads FFXiMain-6AE818B4 from CRYSTAL_FFXIMAIN_DUMPS; skips when absent"]
+    fn the_current_build_derives_the_moved_own_zone_field() {
+        let Some(file) = dump("6AE818B4") else {
+            eprintln!("skipping 6AE818B4: dump not found");
+            return;
+        };
+        let image = dump_image(&file, 0x1000_0000);
+        let friends = scan(&image).friends.expect("friend locations resolve on 6AE818B4");
+        assert_eq!(friends.own_zone_field, 0x3_C400);
+        let c = Ctx::new(&image, PATTERNS);
+        let visible = c.unique("friend.display_area_visible").unwrap();
+        let other = c.unique("friend.other_area").unwrap();
+        for (site, why) in [(friends.display_area + 0x2D, "own zone field: locators disagree"),
+            (visible + 9, "own zone field: locators disagree"), (other + 0xC, "other list own zone field")] {
+            assert_eq!(u32::from_le_bytes(file[site..site + 4].try_into().unwrap()), 0x3_C400, "{site:#x}");
+            let mut edited = file.clone();
+            edited[site..site + 4].copy_from_slice(&0x3_C404u32.to_le_bytes());
+            let error = scan(&dump_image(&edited, 0x1000_0000)).friends.unwrap_err();
+            assert!(error.contains(why), "{site:#x}: {error}");
+        }
     }
 
     /// Applies both of the dump's relocation tables (the packer's and the
@@ -1544,6 +1576,17 @@ mod tests {
             // Read while relocation was running (its first half done): refused.
             let half = scan(&dump_image(&unrelocated(&file, &moved, 2), 0x1800_0000));
             assert!(half.lobby.unwrap_err().contains("not fully relocated"), "{name} half relocated");
+        }
+    }
+
+    #[test]
+    #[ignore = "survey: prints every group for each dump in CRYSTAL_FFXIMAIN_DUMPS"]
+    fn survey_every_dump() {
+        let Some(dir) = std::env::var_os("CRYSTAL_FFXIMAIN_DUMPS").map(std::path::PathBuf::from) else { return; };
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let file = std::fs::read(entry.path()).unwrap();
+            let s = scan(&dump_image(&file, 0x1000_0000));
+            eprintln!("== {}\n{s:#x?}", entry.path().display());
         }
     }
 

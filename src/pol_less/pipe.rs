@@ -43,7 +43,8 @@ pub(crate) enum LoaderEvent {
     NativeSignOutComplete(i32),
     NativeControlResult { action: String, code: i32 },
     ControllerResult { id: u64, ok: bool, message: String },
-    GameShutdownResult { id: u64, game: u64, ok: bool, message: String },
+    /// `answer`: the branch a current loader names (`path`/`reason`); `None` from an older one.
+    GameShutdownResult { id: u64, game: u64, ok: bool, message: String, answer: Option<crate::session_worker::game_shutdown::Answer> },
     NativeSocialReady,
     /// `native_viewer_check`: the loader reached Open(0) and waits for this sign-in's
     /// W2U (:54000) verdict before Open(1) (pol-spec 07c §1).
@@ -57,6 +58,9 @@ pub(crate) enum LoaderEvent {
     /// `notice`: one line for the launch history (a protection the host could not provide,
     /// and why). The game goes on.
     Notice(String),
+    /// `log`: one of the host's key lines (auto-login retries, disconnects, how the game
+    /// ended), for this game's log beside the launcher's own lines.
+    Log(String),
     /// A type this launcher doesn't know; ignored.
     Unknown,
     /// The pipe closed.
@@ -131,6 +135,12 @@ struct Incoming {
     ok: Option<bool>,
     #[serde(default)]
     state: Option<u64>,
+    #[serde(default)]
+    line: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Parse one loader line (without its `\n`).
@@ -202,6 +212,7 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
             ok: value.ok.ok_or("Invalid shutdown result.")?,
             message: value.message.filter(|text| text.len() <= 512 && !text.chars().any(char::is_control))
                 .ok_or("Invalid shutdown result message.")?,
+            answer: crate::session_worker::game_shutdown::Answer::parse(value.ok == Some(true), value.path.as_deref(), value.reason.as_deref()),
         },
         "controller_result" => LoaderEvent::ControllerResult {
             id: value.request_id.ok_or("Invalid controller request identity.")?,
@@ -226,6 +237,10 @@ pub(crate) fn parse_event(line: &[u8]) -> Result<LoaderEvent, String> {
         "error" => LoaderEvent::Error(clean_message(value.message.as_deref().unwrap_or("unspecified error"))),
         "notice" => match value.message.as_deref().map(|text| clean_line(text, 400)).filter(|text| !text.is_empty()) {
             Some(text) => LoaderEvent::Notice(text),
+            None => LoaderEvent::Unknown,
+        },
+        "log" => match value.line.as_deref().map(|text| clean_line(text, 400)).filter(|text| !text.is_empty()) {
+            Some(text) => LoaderEvent::Log(text),
             None => LoaderEvent::Unknown,
         },
         _ => LoaderEvent::Unknown,
@@ -276,9 +291,15 @@ pub(crate) struct LoaderPipe {
     caps: Caps,
     command_wake: Option<crate::session_worker::CommandWake>,
     command_wake_pending: bool,
+    /// The verified host, opened at its hello: its exit status when the session ends.
+    host: Option<crate::host_exit::Host>,
 }
 
 impl LoaderPipe {
+    /// The host this pipe's hello verified, for its exit status (`host_exit`).
+    pub(crate) fn take_host(&mut self) -> Option<crate::host_exit::Host> {
+        self.host.take()
+    }
     pub(crate) fn listen_for_commands(&mut self, wake: Option<crate::session_worker::CommandWake>) {
         self.command_wake = wake;
     }
@@ -366,6 +387,7 @@ impl LoaderPipe {
             LoaderEvent::Hello { pid, caps, .. } => {
                 verify_image(pid, expected_image)?;
                 self.caps = caps;
+                self.host = crate::host_exit::Host::open(pid);
                 Ok(pid)
             }
             _ => Err(t("crystal-loader did not start with a hello; the session was not sent.").into()),
@@ -513,7 +535,7 @@ mod sys {
                 ))?;
                 let event = owned(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()))?;
                 Ok(Self { name, handle, event, buffer: Vec::new(), caps: Caps::default(),
-                    command_wake:None, command_wake_pending:false })
+                    command_wake:None, command_wake_pending:false, host: None })
             }
         }
 
@@ -679,6 +701,17 @@ mod tests {
             line.replace("Requested", "bad\\u0000message")] {
             assert!(parse_event(value.as_bytes()).is_err());
         }
+        // A current loader names its branch; an older one does not; unknown names count as none.
+        use crate::session_worker::game_shutdown::Answer;
+        let answer = |line: &str| match parse_event(line.as_bytes()) { Ok(LoaderEvent::GameShutdownResult { answer, .. }) => answer, other => panic!("{other:?}") };
+        assert_eq!(answer(line), None);
+        assert_eq!(answer(&line.replace("\"Requested\"", "\"Requested\",\"path\":\"world\"")), Some(Answer::World));
+        assert_eq!(answer(&line.replace("\"Requested\"", "\"Requested\",\"path\":\"dialog\"")), Some(Answer::Dialog));
+        let refused = line.replace("\"ok\":true", "\"ok\":false");
+        assert_eq!(answer(&refused.replace("\"Requested\"", "\"No\",\"reason\":\"not_in_world\"")), Some(Answer::NotInWorld));
+        assert_eq!(answer(&refused.replace("\"Requested\"", "\"No\",\"path\":\"dialog\"")), None, "a refusal is never a dialog press");
+        assert_eq!(answer(&line.replace("\"Requested\"", "\"Requested\",\"reason\":\"not_in_world\"")), None);
+        assert_eq!(answer(&line.replace("\"Requested\"", "\"Requested\",\"path\":\"later\"")), None);
     }
 
     #[test]
@@ -775,6 +808,10 @@ mod tests {
         assert_eq!(parse_event(b"{\"type\":\"notice\",\"message\":\"two\\nlines\"}").unwrap(), LoaderEvent::Notice("two lines".into()));
         assert_eq!(parse_event(br#"{"type":"notice"}"#).unwrap(), LoaderEvent::Unknown);
         assert_eq!(parse_event(br#"{"type":"notice","message":"  "}"#).unwrap(), LoaderEvent::Unknown);
+        // The host's key lines for the game's log: flattened to one line, empty ones ignored.
+        assert_eq!(parse_event(br#"{"type":"log","line":"disconnect: pressed OK\non menu"}"#).unwrap(),
+            LoaderEvent::Log("disconnect: pressed OK on menu".into()));
+        assert_eq!(parse_event(br#"{"type":"log"}"#).unwrap(), LoaderEvent::Unknown);
         assert!(parse_event(b"not json").is_err());
         assert!(parse_event(br#"{"type":"hello","pid":1}"#).is_err());
     }

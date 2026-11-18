@@ -109,7 +109,7 @@ fn close_games_instantly_is_off_by_default_persists_and_picks_the_instant_shutdo
     let _ = app.update(Message::Tick);
     let row = &app.accounts[0];
     assert!(row.pid.is_none() && !row.problem && !row.shutting_down);
-    assert_eq!(row.status_text(), t("Game closed normally"));
+    assert!(row.status_text().starts_with(t("FFXI closed.")), "Shut down's end is neutral: {}", row.status_text());
     assert!(row.network_wait.is_none());
     assert_eq!(features::recovery::classify(Some(&report), false, false), features::recovery::EndKind::UserClosed);
 }
@@ -1909,7 +1909,7 @@ fn separate_completions_preserve_other_running_account() {
     app.accounts[1].busy = true;
     app.worker_event(WorkerEvent::Complete(
         second.clone(),
-        Ok(LaunchResult {
+        Ok(LaunchResult { connection_lost: Default::default(),
             pid: 77,
             detail: "started".into(),
             alive: Arc::new(AtomicBool::new(true)),
@@ -1932,7 +1932,7 @@ fn ending_ffxi_keeps_the_pol_session_and_makes_play_available() {
     let mut app = app();
     let key = app.accounts[0].key.clone();
     let game = Arc::new(AtomicBool::new(true));
-    app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult {
+    app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult { connection_lost: Default::default(),
         pid: 123, detail: "fixture".into(), alive: Arc::new(AtomicBool::new(true)),
         game_running: game.clone(), log: PathBuf::new(), outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
     })));
@@ -2404,7 +2404,7 @@ fn coordinated_play_ignores_late_startup_results_and_keeps_other_game() {
     assert!(row.batch_pending && row.busy && row.game_start_pending());
     assert!(!row.can_play());
     assert_eq!(row.status, "Waiting for the other account");
-    app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+    app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult { connection_lost: Default::default(),
         pid: 77, detail: "started together".into(), alive: Arc::new(AtomicBool::new(true)),
         game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
         outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -2422,7 +2422,7 @@ fn failed_coordinated_play_keeps_prepared_session_and_error() {
     app.accounts[0].batch_pending = true;
     app.accounts[0].batch_requested = true;
     app.accounts[0].busy = true;
-    app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+    app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult { connection_lost: Default::default(),
         pid: 77, detail: "signed in".into(), alive: Arc::new(AtomicBool::new(true)),
         game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::from("batch.log"),
         outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -3355,8 +3355,8 @@ fn an_edit_cancels_a_network_retry_and_a_failed_settings_save_still_declines() {
     game_ends(&mut app, 0, signed_out());
     assert!(app.accounts[0].resign.is_some());
     std::fs::create_dir_all(&app.config.experiment).unwrap();
-    let _ = std::fs::remove_dir_all(app.config.experiment.join("iced-launcher"));
-    std::fs::write(app.config.experiment.join("iced-launcher"), b"").unwrap();
+    let _ = std::fs::remove_dir_all(app.config.layout().data());
+    std::fs::write(app.config.layout().data(), b"").unwrap();
     let _ = app.update(Message::EditAccount(key.clone()));
     let _ = app.update(Message::AccountsSaved(Ok(saved)));
     assert!(app.status.starts_with("Accounts saved, but launcher settings were not saved"), "{}", app.status);
@@ -3423,7 +3423,7 @@ fn queued_play_waits_for_vault_and_file_operations_then_uses_signed_in_host() {
     let clicked = Instant::now() - Duration::from_secs(2);
     row.queued_play = Some(clicked);
     let key = row.key.clone();
-    app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult {
+    app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult { connection_lost: Default::default(),
         pid: 123, detail: "fixture".into(), alive: Arc::new(AtomicBool::new(true)),
         game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::new(),
         outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -4057,7 +4057,7 @@ fn an_account_whose_sign_in_took_a_code_is_remembered_as_one() {
         let row = &mut app.accounts[0];
         (row.busy, row.otp_spent, row.launch_trigger) = (true, spent, trigger);
         let key = row.key.clone();
-        app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult {
+        app.worker_event(WorkerEvent::Complete(key, Ok(LaunchResult { connection_lost: Default::default(),
             pid: 41, detail: "signed in".into(), alive: Arc::new(AtomicBool::new(true)),
             game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::new(),
             outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -4149,7 +4149,7 @@ fn a_first_play_teaches_whether_the_account_is_pre_signed() {
         let row = &mut app.accounts[index];
         (row.busy, row.otp_spent, row.launch_trigger) = (true, code, Some(launch_timing::LaunchTrigger::Play));
         let key = row.key.clone();
-        app.worker_event(WorkerEvent::Complete(key, result.map(|()| LaunchResult {
+        app.worker_event(WorkerEvent::Complete(key, result.map(|()| LaunchResult { connection_lost: Default::default(),
             pid: 41, detail: "Client started".into(), alive: Arc::new(AtomicBool::new(true)),
             game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
             outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -4249,7 +4249,7 @@ fn a_pre_sign_in_refused_for_another_reason_asks_for_no_code() {
         // The user's Play without a code works: known again to need none.
         let row = &mut app.accounts[0];
         (row.busy, row.launch_trigger, row.presign_login) = (true, Some(launch_timing::LaunchTrigger::Play), false);
-        app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+        app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult { connection_lost: Default::default(),
             pid: 41, detail: "Client started".into(), alive: Arc::new(AtomicBool::new(true)),
             game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
             outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -4318,7 +4318,7 @@ fn a_batch_marks_only_the_refused_account_otp() {
         (row.busy, row.batch_pending, row.batch_requested, row.presign_login) = (true, true, true, true);
         row.launch_trigger = Some(launch_timing::LaunchTrigger::QueuedPlay);
     }
-    app.worker_event(WorkerEvent::Complete(ready.clone(), Ok(LaunchResult {
+    app.worker_event(WorkerEvent::Complete(ready.clone(), Ok(LaunchResult { connection_lost: Default::default(),
         pid: 70, detail: "Signed in.".into(), alive: Arc::new(AtomicBool::new(true)),
         game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::from("batch.log"),
         outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -4372,7 +4372,7 @@ fn an_authenticator_key_makes_an_otp_account_sign_in_by_itself() {
     // (should the key be removed) and stays eligible.
     let row = &mut app.accounts[0];
     (row.busy, row.resign, row.launch_trigger) = (true, None, Some(launch_timing::LaunchTrigger::StartupSignIn));
-    app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+    app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult { connection_lost: Default::default(),
         pid: 41, detail: "Signed in.".into(), alive: Arc::new(AtomicBool::new(true)),
         game_running: Arc::new(AtomicBool::new(false)), log: PathBuf::new(),
         outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -4438,7 +4438,7 @@ fn a_refused_authenticator_code_falls_back_to_a_typed_code_and_is_not_retried() 
     app.accounts[0].authenticator_refused = true;
     let row = &mut app.accounts[0];
     (row.busy, row.otp_spent, row.launch_trigger) = (true, false, Some(launch_timing::LaunchTrigger::Play));
-    app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+    app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult { connection_lost: Default::default(),
         pid: 41, detail: "Client started".into(), alive: Arc::new(AtomicBool::new(true)),
         game_running: Arc::new(AtomicBool::new(true)), log: PathBuf::new(),
         outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -4587,7 +4587,7 @@ fn a_batch_refused_for_an_update_runs_it_in_the_sessions_the_batch_kept() {
         row.play_timing = Some(launch_timing::Timeline::begin_at(clicked));
     }
     for (at, key) in keys.iter().enumerate() {
-        app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult {
+        app.worker_event(WorkerEvent::Complete(key.clone(), Ok(LaunchResult { connection_lost: Default::default(),
             pid: 70 + at as u32, detail: "Signed in.".into(), alive: Arc::new(AtomicBool::new(true)),
             game_running: Arc::new(AtomicBool::new(false)), log: root.join("batch.log"),
             outcome: Arc::new(std::sync::Mutex::new(None)), timing: String::new(),
@@ -4843,7 +4843,7 @@ fn dragging_accounts_persists_order_without_rewriting_credentials_or_live_state(
     app.page = Page::Home;
     let values: Vec<_> = app.accounts.iter().map(|row| row.account.clone()).collect();
     backend::save_accounts(&app.config, &values).unwrap();
-    let vault = root.join("iced-launcher/accounts.dpapi");
+    let vault = app.config.layout().vault();
     let ciphertext = std::fs::read(&vault).unwrap();
     let original: Vec<_> = app.accounts.iter().map(|row| row.key.clone()).collect();
     let alive = Arc::new(AtomicBool::new(true));
@@ -4910,7 +4910,7 @@ fn canceled_or_failed_account_drags_restore_the_previous_order() {
     assert_eq!(app.accounts.iter().map(|row| row.key.clone()).collect::<Vec<_>>(), original);
     let root = std::env::temp_dir().join(format!("crystal-order-failure-{}", backend::unique_id().unwrap()));
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("iced-launcher"), b"blocked settings directory").unwrap();
+    std::fs::write(crate::storage::Layout::at(&root).data(), b"blocked settings directory").unwrap();
     app.config.experiment = root.clone();
     app.preview = false;
     let _ = app.update(Message::AccountDragStart(original[0].clone()));
@@ -5055,7 +5055,7 @@ fn account_settings_failure_can_retry_after_the_vault_saved_a_new_key() {
     let root = std::env::var_os("CRYSTAL_DATA_ROOT").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
         .join(format!("crystal-account-retry-{}", backend::unique_id().unwrap()));
     std::fs::create_dir_all(&root).unwrap();
-    let blocker = root.join("iced-launcher");
+    let blocker = crate::storage::Layout::at(&root).data();
     std::fs::write(&blocker, b"settings parent is temporarily unavailable").unwrap();
     let mut app = app();
     app.config = Config { experiment: root.clone(), repository: root.join("runtime"), game_install: None, dat_overlays: Vec::new() };
@@ -5214,7 +5214,7 @@ fn every_play_path_sends_character_select_to_the_loader() {
         ("batch Play", false, launch_timing::LaunchTrigger::BatchPlay),
         ("pre-sign-in for a later Play", true, launch_timing::LaunchTrigger::StartupSignIn)] {
         // As start_launch and start_together set it up.
-        let mut plan = play_plan(&launch_tools::State::default(), &settings, &features, &account).unwrap();
+        let mut plan = play_plan(&launch_tools::State::default(), &settings, &features, &account, 1).unwrap();
         (plan.social_only, plan.viewer_gaps, plan.trigger) = (social_only, social_only, trigger);
         assert_eq!((plan.auto_login, plan.dismiss_disconnect), (on, true), "{path}");
         let [mut session, park, mut credentials] = pol_less::play_lines_for_test(&config, &plan, &account, install, pol).unwrap();
@@ -5228,7 +5228,7 @@ fn every_play_path_sends_character_select_to_the_loader() {
         }
     }
     // Without the features runtime the Recovery flag is off, and character select stays on.
-    let plan = play_plan(&launch_tools::State::default(), &settings, &None, &account).unwrap();
+    let plan = play_plan(&launch_tools::State::default(), &settings, &None, &account, 1).unwrap();
     assert_eq!((plan.auto_login, plan.dismiss_disconnect), (on, false));
     drop(features);
     let _ = std::fs::remove_dir_all(&root);

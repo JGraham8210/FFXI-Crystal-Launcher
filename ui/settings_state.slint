@@ -66,6 +66,10 @@ export struct SettingsStrings {
     will-run: string,
     manual-toggle: string,
     open-features: string,
+    logs-title: string,
+    logs-body: string,
+    logs-open: string,
+    logs-export: string,
     about-name: string,
     about-version: string,
     about-1: string,
@@ -457,6 +461,9 @@ export global SettingsView {
     callback component-cancel(int);
     callback components-manual();
     callback components-features();
+    /// Logs: open the folder; export an anonymised zip to the Desktop.
+    callback logs-open();
+    callback logs-export();
 
     // ---- Graphics, Sound & interface ----
     in property <Dg> dg;

@@ -115,14 +115,14 @@ fn has_hash(path: &Path, hash: &str) -> bool {
     file_hash(path).is_some_and(|h| h == hash)
 }
 
-/// Crystal's per-user data folder (the one `crystal\pol.exe` lives under).
+/// Crystal's `Runtime` folder (the one the extracted `host\pol.exe` lives under).
 pub(crate) fn data_root() -> PathBuf {
     crate::pol_less::tools::embedded::data_dir()
 }
 
-/// `<root>\crystal\dgvoodoo\<version>`.
+/// `<runtime>\dgvoodoo\<version>`.
 pub(crate) fn cache_dir(root: &Path, release: &Release) -> PathBuf {
-    root.join("crystal").join("dgvoodoo").join(release.version)
+    crate::storage::dgvoodoo_dir(root, release.version)
 }
 
 /// Every DLL (and the settings app) is in the cache and matches its pinned hash.
@@ -552,10 +552,10 @@ pub(crate) fn remove_from(release: &Release, loader_dir: &Path) -> Result<Vec<St
     if errors.is_empty() { Ok(removed) } else { Err(errors.join("\n")) }
 }
 
-/// The folders a loader can run from: `crystal\`, each versioned `crystal\<hash8>\`, and the
+/// The folders a loader can run from: `host\`, each versioned `host\<hash8>\`, and the
 /// Settings override's folder.
 pub(crate) fn loader_dirs(root: &Path, override_path: &str) -> Vec<PathBuf> {
-    let crystal = root.join("crystal");
+    let crystal = crate::storage::host_dir(root);
     let mut dirs = vec![crystal.clone()];
     for entry in fs::read_dir(&crystal).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -577,7 +577,7 @@ pub(crate) fn loader_dirs(root: &Path, override_path: &str) -> Vec<PathBuf> {
 /// Removes the placed files everywhere a loader can run from, ReShade's host folders included.
 fn remove_everywhere(release: &Release, root: &Path, override_path: &str) -> Result<(), String> {
     let mut errors = Vec::new();
-    let hosts = fs::read_dir(crate::reshade::folder(root).join("hosts"))
+    let hosts = fs::read_dir(crate::storage::reshade_hosts(&crate::reshade::folder(root)))
         .into_iter()
         .flatten()
         .flatten()
@@ -1124,10 +1124,10 @@ mod tests {
         let (mut bytes, release) = synthetic();
         *bytes.last_mut().unwrap() ^= 0xff;
         assert!(install_from_zip(&root, &bytes, &release, None).is_err());
-        assert!(!root.join("crystal").exists(), "nothing is extracted from an unverified zip");
+        assert!(!crate::storage::host_dir(&root).exists(), "nothing is extracted from an unverified zip");
         // The real pin refuses anything but the real release.
         assert!(install_from_zip(&root, b"not the release", &PINNED, None).is_err());
-        assert!(!root.join("crystal").exists());
+        assert!(!crate::storage::host_dir(&root).exists());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1139,7 +1139,7 @@ mod tests {
         dlls[0].sha256 = "00".repeat(32).leak();
         release.dlls = Box::leak(dlls.into_boxed_slice());
         assert!(install_from_zip(&root, &bytes, &release, None).is_err());
-        assert!(!root.join("crystal").exists());
+        assert!(!crate::storage::host_dir(&root).exists());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     fn a_default_conf_carried_to_a_new_version_becomes_the_baseline_with_a_backup() {
         let root = temp("migrate-default");
-        let old = root.join("crystal").join("dgvoodoo").join("2.87.5");
+        let old = crate::storage::dgvoodoo_dir(&root, "2.87.5");
         fs::create_dir_all(&old).unwrap();
         let seeded = set_values(CONF_TEXT, WATERMARK_OFF);
         fs::write(old.join(CONF), &seeded).unwrap();
@@ -1247,7 +1247,7 @@ mod tests {
     #[test]
     fn a_tuned_conf_is_carried_forward_noted_once_and_reset_on_request() {
         let root = temp("migrate-tuned");
-        let old = root.join("crystal").join("dgvoodoo").join("2.87.5");
+        let old = crate::storage::dgvoodoo_dir(&root, "2.87.5");
         fs::create_dir_all(&old).unwrap();
         let tuned = set_values(CONF_TEXT, &[("DirectX", "VRAM", "512"), ("DirectX", "dgVoodooWatermark", "false"), ("General", "OutputAPI", "d3d12_fl12_0")]);
         fs::write(old.join(CONF), &tuned).unwrap();
@@ -1282,7 +1282,7 @@ mod tests {
     fn the_next_launch_removes_the_ddraw_and_d3dimm_crystal_placed_and_keeps_the_users() {
         let (root, release) = installed_root("retired");
         // 1.0.8 placed 2.87.5's three DLLs and recorded them.
-        let ours = root.join("crystal").join("0123abcd");
+        let ours = crate::storage::host_dir(&root).join("0123abcd");
         fs::create_dir_all(&ours).unwrap();
         for (name, bytes) in [("D3D8.dll", OLD_D3D8), ("D3DImm.dll", OLD_D3DIMM), ("DDraw.dll", OLD_DDRAW)] {
             fs::write(ours.join(name), bytes).unwrap();
@@ -1317,7 +1317,7 @@ mod tests {
     #[test]
     fn conf_precedence_crystal_then_playonline_then_default() {
         let root = temp("conf");
-        let dir = root.join("crystal").join("dgvoodoo").join("2.0");
+        let dir = crate::storage::dgvoodoo_dir(&root, "2.0");
         fs::create_dir_all(&dir).unwrap();
         let pol = root.join("PlayOnlineViewer").join(CONF);
         fs::create_dir_all(pol.parent().unwrap()).unwrap();
@@ -1334,7 +1334,7 @@ mod tests {
         seed_conf(&dir, Some(&pol), CONF_TEXT.as_bytes()).unwrap();
         assert_eq!(fs::read_to_string(dir.join(CONF)).unwrap(), "edited in Crystal");
         // A new version starts from the older version's Crystal conf, over PlayOnline's.
-        let newer = root.join("crystal").join("dgvoodoo").join("3.0");
+        let newer = crate::storage::dgvoodoo_dir(&root, "3.0");
         fs::create_dir_all(&newer).unwrap();
         seed_conf(&newer, Some(&pol), CONF_TEXT.as_bytes()).unwrap();
         assert_eq!(fs::read_to_string(newer.join(CONF)).unwrap(), "edited in Crystal");
@@ -1372,8 +1372,8 @@ mod tests {
     #[test]
     fn files_go_next_to_the_standard_and_the_versioned_loader() {
         let (root, release) = installed_root("place");
-        let standard = root.join("crystal");
-        let versioned = root.join("crystal").join("0123abcd");
+        let standard = crate::storage::host_dir(&root);
+        let versioned = crate::storage::host_dir(&root).join("0123abcd");
         fs::create_dir_all(&versioned).unwrap();
         fs::write(standard.join("pol.exe"), b"loader").unwrap();
         fs::write(versioned.join("pol.exe"), b"loader 2").unwrap();
@@ -1422,7 +1422,7 @@ mod tests {
     #[test]
     fn removal_leaves_files_that_are_not_crystals_alone() {
         let (root, release) = installed_root("remove");
-        let dir = root.join("crystal");
+        let dir = crate::storage::host_dir(&root);
         place(&root, &release, &dir).unwrap();
         // The user adds their own DDraw.dll and edits the conf by hand next to the loader.
         fs::write(dir.join("DDraw.dll"), b"user ddraw").unwrap();
@@ -1452,7 +1452,7 @@ mod tests {
         // leave enough ownership information for a later release to retry.
         for sharing in [0, 3] {
             let (root, release) = installed_root(&format!("locked-removal-{sharing}"));
-            let dir = root.join("crystal");
+            let dir = crate::storage::host_dir(&root);
             place(&root, &release, &dir).unwrap();
             let manifest = fs::read(dir.join(MANIFEST)).unwrap();
             let locked_dll = fs::OpenOptions::new().read(true).share_mode(sharing)
@@ -1515,7 +1515,7 @@ mod tests {
         let conf = fs::read_to_string(cache.join(CONF)).unwrap();
         assert_eq!(conf, baseline(&stock));
         assert!(conf.lines().any(|l| l.starts_with("VRAM") && l.trim_end().ends_with("= 1024")));
-        let loader = root.join("crystal");
+        let loader = crate::storage::host_dir(&root);
         place(&root, &PINNED, &loader).unwrap();
         assert!(loader.join("D3D8.dll").is_file() && loader.join(CONF).is_file() && !loader.join("DDraw.dll").exists());
         // The real D3D8.dll is recognized as dgVoodoo by its version resource.
@@ -1535,7 +1535,7 @@ mod tests {
     fn a_missing_cache_reports_not_installed() {
         let root = temp("not-installed");
         let (_, release) = synthetic();
-        assert_eq!(place(&root, &release, &root.join("crystal")), Err(PlaceError::NotInstalled));
+        assert_eq!(place(&root, &release, &crate::storage::host_dir(&root)), Err(PlaceError::NotInstalled));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1544,7 +1544,7 @@ mod tests {
     #[test]
     fn concurrent_places_into_one_folder_all_succeed() {
         let (root, release) = installed_root("concurrent");
-        let dir = root.join("crystal");
+        let dir = crate::storage::host_dir(&root);
         fs::write(cache_dir(&root, &release).join(CONF), "edited").unwrap();
         let results: Vec<Result<(), PlaceError>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..6).map(|_| scope.spawn(|| place(&root, &release, &dir))).collect();
@@ -1558,7 +1558,7 @@ mod tests {
     #[test]
     fn removal_also_clears_reshade_host_folders() {
         let (root, release) = installed_root("hosts");
-        let host = crate::reshade::folder(&root).join("hosts").join("0123456789abcdef-0123456789abcdef");
+        let host = crate::storage::reshade_hosts(&crate::reshade::folder(&root)).join("0123456789abcdef-0123456789abcdef");
         fs::create_dir_all(&host).unwrap();
         place(&root, &release, &host).unwrap();
         remove_everywhere(&release, &root, "").unwrap();

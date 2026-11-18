@@ -256,6 +256,8 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_components_check(|| act(|s| s.prereqs.as_ref().filter(|f| f.check_again.enabled).map(|f| Message::Prereqs(f.check_again.msg.msg()))));
     view.on_components_manual(|| emit(Message::Prereqs(pf::MsgOf::ToggleManual.msg())));
     view.on_components_features(|| emit(Message::Prereqs(pf::MsgOf::OpenWindowsFeatures.msg())));
+    view.on_logs_open(|| emit(Message::Logs(crate::log_export::Msg::Open)));
+    view.on_logs_export(|| emit(Message::Logs(crate::log_export::Msg::Export)));
 
     // ---- Graphics ----
     use crate::dgvoodoo::Msg as Dgv;
@@ -487,6 +489,10 @@ fn strings() -> SettingsStrings {
         will_run: t("Will run").into(),
         manual_toggle: t("How to enable it manually").into(),
         open_features: t("Open Windows Features").into(),
+        logs_title: t("Logs").into(),
+        logs_body: t("Game logs, the launch history and the game host's log. Exports leave out names, accounts and settings.").into(),
+        logs_open: t("Open logs folder").into(),
+        logs_export: t("Export logs").into(),
         about_name: "Crystal Launcher".into(),
         about_version: format!("Version {} · GPL-3.0-only", env!("CARGO_PKG_VERSION")).into(),
         about_1: t("Independent launcher. Not affiliated with or endorsed by Square Enix.").into(),

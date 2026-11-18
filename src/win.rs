@@ -43,6 +43,25 @@ pub(crate) fn system32() -> std::path::PathBuf {
     from_wide(&buffer[..len]).into()
 }
 
+/// A known folder (`FOLDERID_*`) as Windows records it for this user, never from the
+/// environment.
+pub(crate) fn known_folder(id: &windows_sys::core::GUID) -> std::io::Result<std::path::PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY};
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `raw` is an out-pointer; on return it is a NUL-terminated CoTaskMem string (or
+    // null), read before being freed exactly once.
+    unsafe {
+        let hr = SHGetKnownFolderPath(id, KF_FLAG_DONT_VERIFY as u32, std::ptr::null_mut(), &mut raw);
+        let path = (hr >= 0 && !raw.is_null()).then(|| {
+            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
+            std::path::PathBuf::from(from_wide(std::slice::from_raw_parts(raw, len)))
+        });
+        CoTaskMemFree(raw as _);
+        path.filter(|p| p.is_absolute()).ok_or_else(|| std::io::Error::other(format!("no known folder (0x{hr:08X})")))
+    }
+}
+
 /// Windows code pages used by more than one module.
 pub(crate) mod codepage {
     /// The system ANSI code page.

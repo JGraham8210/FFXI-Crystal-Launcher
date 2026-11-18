@@ -20,7 +20,8 @@ pub(crate) mod hotkeys;
 pub(crate) mod keyhook;
 pub(crate) mod layouts;
 pub(crate) mod notify;
-
+pub(crate) mod pad_view;
+pub(crate) mod padchord;
 pub(crate) mod perf;
 pub(crate) mod playtime;
 pub(crate) mod profiles;

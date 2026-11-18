@@ -12,6 +12,8 @@ pub(crate) struct State {
     pub region: u8,
     pub batch: Option<ImportBatch>,
     pub error: String,
+    /// What an "Update existing account" added, shown once it is saved.
+    pub result: String,
     generation: u64,
 }
 
@@ -138,7 +140,11 @@ impl App {
                         auto_login, key, account,
                     });
                     state.open = false;
-                    self.status = t("Review imported account details, complete missing fields, then save. Existing saved fields were kept.").into();
+                    let note = t("Review imported account details, complete missing fields, then save. Existing saved fields were kept.");
+                    self.status = match &draft.key_status {
+                        Some(line) => format!("{}. {note}", line.trim_end_matches('.')),
+                        None => note.into(),
+                    };
                 }
             }
             _ => {}
@@ -169,17 +175,74 @@ fn matches_existing(draft: &ImportDraft, account: &Account) -> bool {
 fn merge_draft(draft: &ImportDraft, existing: Option<&Account>) -> Account {
     let mut account = existing.cloned().unwrap_or_else(crate::blank_account);
     if existing.is_none() { account.region = draft.region; account.label.clear(); }
-    for (target, source) in [(&mut account.label, &draft.label), (&mut account.pol_id, &draft.pol_id),
-        (&mut account.pol_password, &draft.pol_password), (&mut account.se_id, &draft.se_id), (&mut account.se_password, &draft.se_password),
-        (&mut account.totp_key, &draft.totp_key)] {
-        if target.is_empty() { target.clone_from(source); }
-    }
-    if account.launch_with.is_none() { account.launch_with = draft.launch_with; }
-    if account.ashita_boot_ini.is_none() { account.ashita_boot_ini.clone_from(&draft.ashita_boot_ini); }
-    if account.windower_profile.is_none() { account.windower_profile.clone_from(&draft.windower_profile); }
+    let mut source = crate::blank_account();
+    source.label.clone_from(&draft.label); source.pol_id.clone_from(&draft.pol_id);
+    source.pol_password.clone_from(&draft.pol_password); source.se_id.clone_from(&draft.se_id);
+    source.se_password.clone_from(&draft.se_password); source.totp_key.clone_from(&draft.totp_key);
+    source.launch_with = draft.launch_with;
+    source.ashita_boot_ini.clone_from(&draft.ashita_boot_ini);
+    source.windower_profile.clone_from(&draft.windower_profile);
+    fill_empty(&mut account, &source);
     account
 }
 
+/// Copies each of `source`'s values into the same field of `target` only where `target`'s is
+/// empty, and names the fields that gained a value. Never overwrites.
+fn fill_empty(target: &mut Account, source: &Account) -> Vec<&'static str> {
+    let mut added = Vec::new();
+    for (name, to, from) in [(t("name"), &mut target.label, &source.label), (t("PlayOnline ID"), &mut target.pol_id, &source.pol_id),
+        (t("PlayOnline password"), &mut target.pol_password, &source.pol_password), (t("Square Enix ID"), &mut target.se_id, &source.se_id),
+        (t("Square Enix password"), &mut target.se_password, &source.se_password), (t("authenticator key"), &mut target.totp_key, &source.totp_key)] {
+        if to.is_empty() && !from.is_empty() { to.clone_from(from); added.push(name); }
+    }
+    if target.launch_with.is_none() && source.launch_with.is_some() { target.launch_with = source.launch_with; added.push(t("launcher")); }
+    if target.ashita_boot_ini.is_none() && source.ashita_boot_ini.is_some() { target.ashita_boot_ini.clone_from(&source.ashita_boot_ini); added.push(t("Ashita configuration")); }
+    if target.windower_profile.is_none() && source.windower_profile.is_some() { target.windower_profile.clone_from(&source.windower_profile); added.push(t("Windower profile")); }
+    added
+}
+
+impl App {
+    /// The saved account a new (unsaved) sheet would duplicate, when it can be updated now.
+    pub(crate) fn merge_target(&self, editor: &Editor) -> Option<usize> {
+        if editor.key.is_some() || editor.account.mode != AccountMode::Retail || !self.vault_ready || self.vault_saving { return None; }
+        let key = crate::backend::account_key(&editor.account);
+        self.accounts.iter().position(|row| row.key == key && !row.busy && row.pid.is_none())
+    }
+
+    /// "Update existing account": the sheet's values fill that account's empty fields, then it
+    /// saves through the ordinary edit path, so its launcher settings are kept.
+    pub(crate) fn merge_account(&mut self) -> Effect<Message> {
+        let Some(index) = self.editor.as_ref().and_then(|editor| self.merge_target(editor)) else { return Effect::none() };
+        let mut source = self.editor.as_ref().map(|editor| editor.account.clone()).unwrap_or_else(crate::blank_account);
+        if !source.totp_key.trim().is_empty() {
+            match crate::totp::normalize(&source.totp_key) {
+                Ok(key) => source.totp_key = key.to_string(),
+                Err(error) => { self.status = error.message().into(); return Effect::none(); }
+            }
+        }
+        let row = &self.accounts[index];
+        let key = row.key.clone();
+        let mut account = row.account.clone();
+        let added = fill_empty(&mut account, &source);
+        if added.is_empty() {
+            self.editor = None;
+            if self.account_import.batch.is_some() { self.account_import.open = true; }
+            self.status = t("Nothing to add").into();
+            return Effect::none();
+        }
+        let list = added.join(", ");
+        self.account_import.result = crate::i18n::tf("Added: {fields}", &[("fields", &list)]);
+        let settings = &self.settings;
+        self.editor = Some(Editor {
+            game_install: settings.account_installs.get(&key).cloned().unwrap_or_default(),
+            dat_overlays: settings.account_overlays.get(&key).cloned().unwrap_or_default(),
+            flags: crate::EditorFlags { uses_otp: settings.account_otp.contains(&key), ..Default::default() },
+            auto_login: settings.account_auto_login.get(&key).copied().unwrap_or_default().normalized(),
+            key: Some(key), account,
+        });
+        self.update(Message::SaveAccount)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +263,127 @@ mod tests {
         draft.region = 2;
         assert!(matches_existing(&draft, &saved), "POL identity does not depend on the import region");
         assert_eq!(merge_draft(&draft, Some(&saved)).region, saved.region);
+    }
+
+    /// Review, then Save, for a Forest profile that came with an authenticator key: a new
+    /// account is saved with it, and a saved account that took typed codes gains it. Either
+    /// then signs in without a typed code.
+    #[test]
+    fn a_reviewed_forest_profile_saves_its_authenticator_key() {
+        use crate::{backend, Message};
+        const KEY: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        crate::i18n::set(crate::i18n::Lang::En);
+        let mut app = crate::tests::app();
+        app.preview = false;
+        app.launches = Some(Vec::new());
+        app.config.experiment = std::env::temp_dir().join(format!("crystal-import-key-{}", backend::unique_id().unwrap()));
+        for row in &mut app.accounts { row.busy = false; row.pid = None; }
+        let saved_id = app.accounts[0].account.pol_id.clone();
+        let saved_key = app.accounts[0].key.clone();
+        app.settings.note_sign_in(&saved_key, true);
+        assert!(crate::account_row::needs_code(&app, &app.accounts[0]), "typed codes so far");
+        let draft = |pol_id: &str| {
+            let mut draft = ImportDraft::default();
+            draft.label = "Tank".into(); draft.pol_id = pol_id.into(); draft.pol_password = "synthetic".into();
+            draft.se_id = "sample09".into(); draft.se_password = "synthetic".into(); draft.totp_key = KEY.into();
+            draft.key_status = Some("Authenticator key imported".into());
+            draft
+        };
+        for (pol_id, existing) in [("NEW00001", false), (saved_id.as_str(), true)] {
+            app.account_import.open = true;
+            app.account_import.batch = Some(ImportBatch { drafts: vec![draft(pol_id)], warnings: Vec::new() });
+            let _ = app.update(Message::AccountImport(Msg::Review(0)));
+            assert!(app.status.starts_with("Authenticator key imported. "), "the sheet keeps the key status: {}", app.status);
+            let editor = app.editor.as_ref().expect("the review opens the account sheet");
+            assert_eq!((editor.key.is_some(), editor.account.totp_key.as_str()), (existing, KEY));
+            assert!(app.update(Message::SaveAccount).is_async(), "{}", app.status);
+            // What that save writes, read back from the vault.
+            let edited = app.editor.as_ref().unwrap();
+            let mut values: Vec<Account> = app.accounts.iter()
+                .map(|row| if Some(&row.key) == edited.key.as_ref() { edited.account.clone() } else { row.account.clone() }).collect();
+            if edited.key.is_none() { values.push(edited.account.clone()); }
+            backend::save_accounts(&app.config, &values).unwrap();
+            let _ = app.update(Message::AccountsSaved(backend::load_accounts(&app.config)));
+            let row = app.accounts.iter().find(|row| row.account.pol_id == pol_id).expect("saved");
+            assert_eq!(row.account.totp_key, KEY, "existing account: {existing}");
+            assert!(row.authenticator_ready() && !crate::account_row::needs_code(&app, row), "existing account: {existing}");
+        }
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+    }
+
+    #[test]
+    fn the_first_selected_source_is_forest_then_the_newest_file() {
+        use account_import::SourceKind;
+        let root = std::env::temp_dir().join(format!("crystal-source-{}", crate::backend::unique_id().unwrap()));
+        let file = |folder: &str| { let dir = root.join(folder); std::fs::create_dir_all(&dir).unwrap(); let p = dir.join("creds.dat"); std::fs::write(&p, "{}").unwrap(); p };
+        std::fs::create_dir_all(&root).unwrap();
+        let pol = root.join("login_w.bin"); std::fs::write(&pol, "x").unwrap();
+        let (auto, forest) = (file("POLAutoLogin"), file("Forest"));
+        let source = |kind, path: &std::path::PathBuf| ImportSource { kind, path: path.clone(), region: None };
+        let sources = vec![source(SourceKind::PlayOnline, &pol), source(SourceKind::Forest, &auto), source(SourceKind::Forest, &forest)];
+        assert_eq!(account_import::default_source(&sources).map(|s| &s.path), Some(&forest), "Forest over POLAutoLogin, whatever the order");
+        // Two Forest-kind files outside a Forest folder: the newer one.
+        let (old, new) = (file("A"), file("B"));
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)).unwrap();
+        let sources = vec![source(SourceKind::PlayOnline, &pol), source(SourceKind::Forest, &old), source(SourceKind::Forest, &new)];
+        assert_eq!(account_import::default_source(&sources).map(|s| &s.path), Some(&new));
+        // No Forest file: the first source.
+        assert_eq!(account_import::default_source(&sources[..1]).map(|s| &s.path), Some(&pol));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn updating_an_existing_account_fills_only_its_empty_fields() {
+        const KEY: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        crate::i18n::set(crate::i18n::Lang::En);
+        let mut saved = crate::blank_account();
+        saved.pol_id = "ABCD1234".into(); saved.se_password = "saved-se".into(); saved.windower_profile = Some("Mine".into());
+        let mut typed = crate::blank_account();
+        typed.pol_id = "abcd1234".into(); typed.se_password = "typed-se".into(); typed.se_id = "typedse".into();
+        typed.totp_key = KEY.into(); typed.windower_profile = Some("Other".into()); typed.ashita_boot_ini = Some("a.ini".into());
+        let mut result = saved.clone();
+        let added = fill_empty(&mut result, &typed);
+        assert_eq!(added, ["Square Enix ID", "authenticator key", "Ashita configuration"]);
+        assert_eq!((result.se_password.as_str(), result.windower_profile.as_deref()), ("saved-se", Some("Mine")), "never overwritten");
+        assert_eq!((result.se_id.as_str(), result.totp_key.as_str(), result.ashita_boot_ini.as_deref()), ("typedse", KEY, Some("a.ini")));
+        assert!(fill_empty(&mut result, &typed).is_empty(), "a second pass adds nothing");
+
+        // The sheet button: a new account for a saved login updates that account in place.
+        let mut app = crate::tests::app();
+        app.preview = false;
+        app.config.experiment = std::env::temp_dir().join(format!("crystal-merge-{}", crate::backend::unique_id().unwrap()));
+        for row in &mut app.accounts { row.busy = false; row.pid = None; row.account.totp_key.clear(); }
+        let existing = app.accounts[0].account.clone();
+        let existing_key = app.accounts[0].key.clone();
+        let sheet = |totp: &str, se_id: &str| {
+            let mut account = crate::blank_account();
+            account.pol_id = existing.pol_id.clone(); account.totp_key = totp.into(); account.se_id = se_id.into();
+            account.se_password = "typed-over".into();
+            Editor { key: None, account, game_install: String::new(), dat_overlays: Vec::new(),
+                auto_login: crate::pol_less::AutoLogin::default(), flags: Default::default() }
+        };
+        app.editor = Some(sheet("jbsw y3dp ehpk 3pxp", "x"));
+        assert!(app.merge_target(app.editor.as_ref().unwrap()).is_some());
+        assert!(app.merge_account().is_async(), "{}", app.status);
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.key.as_ref(), Some(&existing_key), "saves as an edit of the saved account");
+        assert_eq!(editor.account.totp_key, "JBSWY3DPEHPK3PXP");
+        assert_eq!(editor.account.se_password, existing.se_password, "a saved password is kept");
+        assert_eq!(editor.account.se_id, if existing.se_id.is_empty() { "x" } else { existing.se_id.as_str() });
+        assert!(app.account_import.result.starts_with("Added: "), "{}", app.account_import.result);
+        assert!(app.account_import.result.contains("authenticator key"));
+        let _ = std::fs::remove_dir_all(&app.config.experiment);
+
+        // Everything already set: nothing is saved.
+        app.vault_saving = false;
+        app.accounts[0].account.totp_key = KEY.into();
+        let mut full = sheet(KEY, "");
+        full.account.se_password.clear();
+        app.editor = Some(full);
+        app.account_import.result.clear();
+        let _ = app.merge_account();
+        assert!(app.editor.is_none() && !app.vault_saving);
+        assert_eq!(app.status, "Nothing to add");
     }
 
     #[test]

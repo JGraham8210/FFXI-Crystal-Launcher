@@ -20,6 +20,8 @@
 
 use super::hotkeys::{Gate, Hotkey, Registrar};
 use super::keyhook::{Fired, KeyHook, OWN_INPUT, WM_HOOK_HOTKEY, WM_HOOK_RELEASE};
+use super::padchord::PadChord;
+use crate::gamepad::padswitch::{PadSwitch, WM_PAD_HOTKEY};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -32,11 +34,13 @@ pub(crate) enum Via {
     Hotkey,
     /// The low-level keyboard hook took the chord over a game (`keyhook`).
     Hook,
+    /// A controller binding fired over a game (`gamepad::padswitch`).
+    Pad,
 }
 
 impl Via {
     pub(crate) fn name(self) -> &'static str {
-        match self { Self::Hotkey => "WM_HOTKEY", Self::Hook => "hook" }
+        match self { Self::Hotkey => "WM_HOTKEY", Self::Hook => "hook", Self::Pad => "pad" }
     }
 }
 
@@ -65,6 +69,9 @@ pub(crate) enum Command {
     /// Replace the hotkeys registered only while a tracked process's window is in the foreground
     /// (`hotkeys::Gate`). Their ids must differ from `Hotkeys`' ids.
     GameHotkeys(Vec<(i32, Hotkey)>),
+    /// Replace the controller hotkeys, read only while a tracked process's window is in the
+    /// foreground (`gamepad::padswitch`). Their ids differ from the keyboard's.
+    PadHotkeys(Vec<(i32, PadChord)>),
     /// Watch these processes' windows (replaces the set).
     Track(Vec<u32>),
     /// Tests: run on the desktop thread.
@@ -115,6 +122,10 @@ struct State {
     in_game: bool,
     /// The keyboard hook's thread, started the first time the in-game keys are armed.
     keyhook: Option<KeyHook>,
+    /// The controller hotkeys, and their reader's thread: started the first time a game is in
+    /// front with one set, parked while none is, ended when none is set.
+    pad_keys: Vec<(i32, PadChord)>,
+    pads: Option<PadSwitch>,
     /// Work waiting for its timer (`later`), by timer id.
     timers: Vec<(usize, Box<dyn FnOnce() + Send>)>,
     next_timer: usize,
@@ -191,7 +202,7 @@ fn run(sink: Sink, queue: Arc<Mutex<VecDeque<Command>>>, ready: std::sync::mpsc:
         STATE.with(|s| *s.borrow_mut() = Some(State {
             sink, queue, window: hwnd, hotkeys: Vec::new(), always: Vec::new(), results: Vec::new(), gate: Gate::default(),
             tracked: BTreeMap::new(), pids: Arc::new(Mutex::new(Vec::new())), foreground_hook: None, in_game: false, keyhook: None,
-            timers: Vec::new(), next_timer: 0,
+            pad_keys: Vec::new(), pads: None, timers: Vec::new(), next_timer: 0,
         }));
         let _ = ready.send(Some(hwnd as isize));
         let mut msg: MSG = std::mem::zeroed();
@@ -208,6 +219,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
     match message {
         WM_HOTKEY => { hotkey(wparam as i32, (lparam >> 16) as u16); 0 }
         WM_HOOK_HOTKEY => { emit(Event::Hotkey { id: wparam as i32, via: Via::Hook, key: Some(Fired::unpack(lparam)) }); 0 }
+        WM_PAD_HOTKEY => { pad_hotkey(wparam as i32); 0 }
         WM_HOOK_RELEASE => {
             // A per-press line for debugging the key hook; release builds leave it out.
             if cfg!(debug_assertions) {
@@ -227,8 +239,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, 
         }
         WM_COMMANDS => { drain(hwnd); 0 }
         WM_DESTROY => {
-            let keyhook = STATE.with(|s| s.borrow_mut().as_mut().and_then(|state| state.keyhook.take()));
-            drop(keyhook); // its thread ends; joined outside the state
+            let threads = STATE.with(|s| s.borrow_mut().as_mut().map(|state| (state.keyhook.take(), state.pads.take())));
+            drop(threads); // their threads end; joined outside the state
             STATE.with(|s| {
                 if let Some(state) = s.borrow_mut().as_mut() {
                     state.gate.disarm(&mut Windows(hwnd));
@@ -319,6 +331,15 @@ fn gate_focus(pid: Option<u32>) -> bool {
 /// Whether a game is in front changed to `game`: arm or disarm the keyboard hook to match the
 /// chords set, and describe the change for the history (nothing while no hotkey is set).
 fn set_in_game(state: &mut State, game: bool) -> Option<String> {
+    let pads = pad_follow(state, game);
+    match (keys_in_game(state, game), pads) {
+        (Some(keys), Some(pads)) => Some(format!("{keys}; {pads}")),
+        (keys, pads) => keys.or(pads),
+    }
+}
+
+/// `set_in_game` for the keyboard: the hook and the registered in-game chords.
+fn keys_in_game(state: &mut State, game: bool) -> Option<String> {
     if game && state.in_game {
         // Game to game: that game takes the keyboard (and DirectInput's own hook) as it comes in
         // front, so the hook is installed again to stay ahead of it. The key that made the switch
@@ -361,6 +382,34 @@ fn set_in_game(state: &mut State, game: bool) -> Option<String> {
     Some(format!("hotkeys: game in front: {}; {hook}", registered.join(", ")))
 }
 
+/// The controller hotkeys follow the foreground: read while a game is in front, parked
+/// otherwise; no thread while none is set. A line for the history only when the reader can't
+/// start.
+fn pad_follow(state: &mut State, game: bool) -> Option<String> {
+    if state.pad_keys.is_empty() {
+        state.pads = None;
+        return None;
+    }
+    if game && state.pads.is_none() {
+        match PadSwitch::start(state.window as isize, state.pad_keys.clone()) {
+            Ok(pads) => state.pads = Some(pads),
+            Err(error) => return Some(format!("hotkeys: game in front: controller reader unavailable ({error})")),
+        }
+    }
+    if let Some(pads) = &state.pads { pads.arm(game); }
+    None
+}
+
+/// A controller binding fired. One that arrives after the foreground left the games (the
+/// reader not parked yet) is dropped: a pad hotkey acts only over a game.
+fn pad_hotkey(id: i32) {
+    let over_game = STATE.with(|s| s.borrow().as_ref().is_some_and(|state| {
+        super::game_window::foreground().is_none_or(|(_, pid)| is_game(state, Some(pid)))
+    }));
+    if over_game { emit(Event::Hotkey { id, via: Via::Pad, key: None }); }
+    else { emit(Event::Log(format!("hotkeys: pad id {id} after the game left the front: dropped"))); }
+}
+
 /// A hotkey was pressed. An in-game one that arrives after the foreground left the games (its
 /// WinEvent not yet handled) is released at once and its key passed on, so the program now in
 /// front still gets its Ctrl+Tab.
@@ -400,6 +449,15 @@ fn drain(hwnd: HWND) {
                 STATE.with(|s| if let Some(state) = s.borrow_mut().as_mut() { state.gate.set_keys(list, game, &mut Windows(hwnd)); });
                 changed = true;
                 rearm = true;
+            }
+            Command::PadHotkeys(list) => {
+                let game = is_game_now();
+                let line = STATE.with(|s| s.borrow_mut().as_mut().and_then(|state| {
+                    if let Some(pads) = &state.pads { pads.set_bindings(list.clone()); }
+                    state.pad_keys = list;
+                    pad_follow(state, game)
+                }));
+                if let Some(line) = line { emit(Event::Log(line)); }
             }
             Command::Track(pids) => {
                 track(&pids);

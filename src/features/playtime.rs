@@ -1,4 +1,4 @@
-//! Play time per client, kept locally in `iced-launcher/playtime.json`. Nothing leaves the
+//! Play time per client, kept locally in `Data\playtime.json`. Nothing leaves the
 //! machine.
 //!
 //! The interface reports a client's start and end; the tracker adds the difference. There is no
@@ -63,7 +63,7 @@ const LIMIT: u64 = 1024 * 1024;
 const MAX_LABEL: usize = 64;
 
 pub(crate) fn path(config: &crate::backend::Config) -> PathBuf {
-    config.experiment.join("iced-launcher").join("playtime.json")
+    config.layout().playtime()
 }
 
 impl Tracker {

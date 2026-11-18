@@ -608,6 +608,34 @@ export component SystemTab inherits VerticalLayout {
         for card[i] in SettingsView.component-cards: ComponentView { index: i; card: card; }
     }
 
+    // Logs, for support.
+    Card {
+        gap: 14px * root.s;
+        HorizontalLayout {
+            spacing: 16px * root.s;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 6px * root.s;
+                CardTitle { text: SettingsView.strings.logs-title; }
+                Text { text: SettingsView.strings.logs-body; font-size: Theme.type-detail * root.s; color: Theme.sub; wrap: word-wrap; }
+            }
+            Control {
+                cross-axis-self-alignment: center;
+                scale: root.s;
+                text: SettingsView.strings.logs-open;
+                glyph: Glyph.folder;
+                clicked => { SettingsView.logs-open(); }
+            }
+            Control {
+                cross-axis-self-alignment: center;
+                scale: root.s;
+                text: SettingsView.strings.logs-export;
+                glyph: Glyph.download;
+                clicked => { SettingsView.logs-export(); }
+            }
+        }
+    }
+
     // Ownership notice.
     VerticalLayout {
         padding-top: 12px * root.s;

@@ -642,7 +642,7 @@ mod tests {
         BatchAccount::new(key.into(),
             Config { experiment: root.into(), repository: root.into(), game_install: None, dat_overlays: Vec::new() },
             Account { label: key.into(), mode: backend::AccountMode::Retail, server: String::new(), pol_id: key.into(), pol_password: "fixture-secret".into(), se_id: String::new(), se_password: String::new(), region: 0, launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() },
-            "123456".into(), Plan { tool: crate::pol_less::Tool::Windower, settings: Default::default(), social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default() })
+            "123456".into(), Plan { tool: crate::pol_less::Tool::Windower, settings: Default::default(), social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0 })
     }
     fn watch_fixture_start(job: &BatchAccount) {
         let directory = job.config.account_directory(&job.account);
@@ -677,7 +677,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(job.key != "dead"));
         let check = if job.key == "fail" { Err("Missing game version.".into()) } else { Ok(()) };
         Ok(Prepared { session: BackgroundSession { path: record_path(&job.config, &job.account), worker },
-            launch: LaunchResult { pid: worker.pid, detail: "Fixture idle session".into(), alive, game_running: Arc::new(AtomicBool::new(false)), outcome: Arc::new(Mutex::new(None)), log: root_log(&job), timing: String::new() }, job, check, start_game: true, version: None })
+            launch: LaunchResult { connection_lost: Default::default(), pid: worker.pid, detail: "Fixture idle session".into(), alive, game_running: Arc::new(AtomicBool::new(false)), outcome: Arc::new(Mutex::new(None)), log: root_log(&job), timing: String::new() }, job, check, start_game: true, version: None })
     }
     fn root_log(job: &BatchAccount) -> PathBuf { job.config.experiment.join("fixture.log") }
     fn until(mut test: impl FnMut() -> bool) {

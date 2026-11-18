@@ -23,30 +23,22 @@ pub struct Config {
     #[serde(default)]
     pub dat_overlays: Vec<PathBuf>,
 }
-/// This user's `%LOCALAPPDATA%` (the temporary folder without one). A test build always gets a
-/// scratch folder instead: a test never reads or replaces the user's settings, accounts or
-/// history, whatever its environment. Live 2026-11-14: `cargo test` runs without
-/// `CRYSTAL_DATA_ROOT` replaced the real settings.json with defaults, and the next launcher
-/// started with every account's character select and sign-in knowledge gone.
-pub(crate) fn local_app_data() -> PathBuf {
-    #[cfg(test)]
-    { std::env::temp_dir().join("crystal-launcher-test-localappdata") }
-    #[cfg(not(test))]
-    { std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir) }
-}
-
+/// The data folder is `storage::root()`. A test build always gets a scratch folder there: a
+/// test never reads or replaces the user's settings, accounts or history, whatever its
+/// environment. Live 2026-11-14: `cargo test` runs without `CRYSTAL_DATA_ROOT` replaced the
+/// real settings.json with defaults, and the next launcher started with every account's
+/// character select and sign-in knowledge gone.
 impl Default for Config {
     fn default() -> Self {
         let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("Crystal-Launcher.exe"));
-        let user_data = local_app_data().join("Crystal Launcher");
-        let mut config = Self::from_locations(&executable, &user_data);
-        if let Some(root) = std::env::var_os("CRYSTAL_DATA_ROOT") {
-            config.experiment = PathBuf::from(root);
-        }
-        config
+        Self::from_locations(&executable, &crate::storage::root())
     }
 }
 impl Config {
+    /// The paths under this configuration's data folder.
+    pub(crate) fn layout(&self) -> crate::storage::Layout {
+        crate::storage::Layout::at(&self.experiment)
+    }
     /// Data lives in this Windows user's data folder; the optional runtime files sit
     /// next to the executable.
     fn from_locations(executable: &Path, user_data: &Path) -> Self {
@@ -66,27 +58,29 @@ impl Config {
         self.game_install
             .as_deref()
             .map(plain_windows_path)
-            .unwrap_or_else(|| self.experiment.join("client"))
+            .unwrap_or_else(|| self.layout().bundled_client())
     }
     fn vault_path(&self) -> PathBuf {
-        self.experiment.join("iced-launcher/accounts.dpapi")
+        self.layout().vault()
     }
-    /// Where this account's per-launch client logs are written.
-    pub fn logs_directory(&self, account: &Account) -> PathBuf {
-        self.account_directory(account).join("logs")
+    /// Where every account's game logs are written (`game_log`).
+    pub fn game_logs_directory(&self) -> PathBuf {
+        self.layout().game_logs()
     }
     /// One line per launch, next to the launcher's other data.
     pub fn history_path(&self) -> PathBuf {
-        self.experiment.join("iced-launcher/launch-history.log")
+        self.layout().history()
     }
     /// The startup files learned per game folder (`startup_prefetch`).
     pub(crate) fn startup_prefetch_path(&self) -> PathBuf {
-        self.experiment.join("iced-launcher/startup-prefetch.json")
+        self.layout().startup_prefetch()
     }
+    /// The account's folder: `Data\accounts\<dir>`, or its 1.2.8 folder while a session that
+    /// an older Crystal started still holds it there (`storage::migrate` moves it later).
     pub(crate) fn account_directory(&self, account: &Account) -> PathBuf {
         let key = account_key(account);
         let mapping: std::collections::BTreeMap<String, String> =
-            fs::read(self.experiment.join("iced-launcher/directories.json"))
+            fs::read(self.layout().directories())
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_default();
@@ -95,7 +89,12 @@ impl Config {
             .filter(|v| v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit()))
             .cloned()
             .unwrap_or(key);
-        self.experiment.join("test-launcher/data").join(directory)
+        let current = self.layout().account(&directory);
+        if !current.exists() {
+            let legacy = crate::storage::migrate::Legacy::at(&self.experiment).account(&directory);
+            if legacy.is_dir() { return legacy; }
+        }
+        current
     }
     fn legacy_directory_key(&self, account: &Account) -> String {
         let mut hash = mode_hasher(account.mode);
@@ -105,7 +104,8 @@ impl Config {
         hex(hash)
     }
     fn preserve_legacy_directories(&self, accounts: &[Account]) -> Result<(), String> {
-        let path = self.experiment.join("iced-launcher/directories.json");
+        let path = self.layout().directories();
+        let legacy_root = crate::storage::migrate::Legacy::at(&self.experiment);
         let mut mapping: std::collections::BTreeMap<String, String> = match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|_| t("Account directory mappings could not be read."))?,
@@ -115,12 +115,7 @@ impl Config {
         for account in accounts {
             let key = account_key(account);
             let legacy = self.legacy_directory_key(account);
-            let directory = if self
-                .experiment
-                .join("test-launcher/data")
-                .join(&legacy)
-                .is_dir()
-            {
+            let directory = if self.layout().account(&legacy).is_dir() || legacy_root.account(&legacy).is_dir() {
                 legacy
             } else {
                 key.clone()
@@ -188,6 +183,8 @@ pub struct LaunchResult {
     pub alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// FFXI can end while the genuine PlayOnline session remains signed in.
     pub game_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The running game shows its fatal network dialog (`friends::Snapshot::connection_lost`).
+    pub connection_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The client's stderr log for this launch.
     pub log: PathBuf,
     /// Filled by the supervisor, before `alive` turns false, with how the client ended.
@@ -613,13 +610,10 @@ pub fn load_accounts(config: &Config) -> Result<Vec<Account>, String> {
     load_accounts_file(&path)
 }
 
-/// First-run import is read-only. The original Test 2 vault is never rewritten.
+/// The saved accounts, with each one's folder name recorded. (The Test 2 vault in
+/// `test-launcher\` is carried into `Data\` by `storage::migrate`.)
 pub fn load_or_import_accounts(config: &Config) -> Result<Vec<Account>, String> {
-    let accounts = if config.vault_path().exists() {
-        load_accounts(config)?
-    } else {
-        load_accounts_file(&config.experiment.join("test-launcher/accounts.dpapi"))?
-    };
+    let accounts = load_accounts(config)?;
     config.preserve_legacy_directories(&accounts)?;
     Ok(accounts)
 }
@@ -639,6 +633,12 @@ fn load_accounts_file(path: &Path) -> Result<Vec<Account>, String> {
     }
     let plaintext = unprotect(&encrypted)?;
     decode_accounts(&plaintext)
+}
+
+/// Whether `encrypted` is a vault this Windows user can decrypt and decode (`storage::migrate`
+/// checks a copied vault with it before the original goes).
+pub(crate) fn vault_readable(encrypted: &[u8]) -> bool {
+    encrypted.len() <= VAULT_LIMIT && unprotect(encrypted).is_ok_and(|plaintext| decode_accounts(&plaintext).is_ok())
 }
 
 pub fn save_accounts(config: &Config, accounts: &[Account]) -> Result<(), String> {
@@ -820,7 +820,7 @@ mod tests {
         let config = Config { experiment: root.clone(), repository: root.clone(),
             game_install: Some(game.clone()), dat_overlays: Vec::new() };
         assert_eq!(config.game_directory(), game);
-        assert!(config.account_directory(&account()).starts_with(root.join("test-launcher/data")));
+        assert!(config.account_directory(&account()).starts_with(config.layout().accounts()));
     }
 
     fn account() -> Account {
@@ -1050,22 +1050,32 @@ mod tests {
         };
         let mut value = account();
         value.server = "Example.COM".into();
-        let legacy = config
-            .experiment
-            .join("test-launcher/data")
-            .join(config.legacy_directory_key(&value));
+        let legacy = config.layout().account(&config.legacy_directory_key(&value));
         fs::create_dir_all(&legacy).unwrap();
         config
             .preserve_legacy_directories(&[value.clone()])
             .unwrap();
         value.server = "example.com".into();
         assert_eq!(config.account_directory(&value), legacy);
-        fs::remove_file(directory.join("iced-launcher/directories.json")).unwrap();
-        fs::remove_dir(directory.join("iced-launcher")).unwrap();
-        fs::remove_dir(legacy).unwrap();
-        fs::remove_dir(directory.join("test-launcher/data")).unwrap();
-        fs::remove_dir(directory.join("test-launcher")).unwrap();
-        fs::remove_dir(directory).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A session an older Crystal started keeps its 1.2.8 folder until the next start moves
+    /// it; until then the launcher works in that folder, never in an empty new one.
+    #[test]
+    fn an_account_folder_not_yet_moved_is_used_where_it_is() {
+        let directory = std::env::temp_dir().join(format!("xi-legacy-account-{}", unique_id().unwrap()));
+        let config = Config { experiment: directory.clone(), repository: directory.clone(), game_install: None, dat_overlays: Vec::new() };
+        let value = account();
+        let current = config.account_directory(&value);
+        assert!(current.starts_with(config.layout().accounts()));
+        let name = current.file_name().unwrap().to_string_lossy().into_owned();
+        let legacy = crate::storage::migrate::Legacy::at(&directory).account(&name);
+        fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(config.account_directory(&value), legacy);
+        fs::create_dir_all(&current).unwrap();
+        assert_eq!(config.account_directory(&value), current, "once moved, the new folder wins");
+        fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn verbatim_paths_become_plain_win32_paths() {
@@ -1153,8 +1163,6 @@ mod tests {
         assert!(load_accounts(&config).unwrap().is_empty());
         fs::write(config.vault_path(), b"invalid DPAPI blob").unwrap();
         assert!(load_accounts(&config).is_err());
-        fs::remove_file(config.vault_path()).unwrap();
-        fs::remove_dir(directory.join("iced-launcher")).unwrap();
-        fs::remove_dir(directory).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 }

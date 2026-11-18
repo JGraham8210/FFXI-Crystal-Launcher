@@ -14,7 +14,9 @@ mod pad;
 mod dialogs;
 mod downloads;
 mod jobs;
+mod pick;
 mod features;
+mod pad_hotkeys;
 mod settings;
 mod sky;
 mod sync;
@@ -195,6 +197,7 @@ impl Host {
             theme.set_scale(scale(&app));
             theme.set_small(small(&app));
             view::sync(&shown.ui, &app);
+            pick::sync(&shown.ui, &app);
             friends::sync(&shown.ui, &app);
             downloads::sync(&shown.ui, &app);
             settings::sync(&shown.ui, &app);
@@ -335,6 +338,7 @@ impl Host {
         let Ok(ui) = MainWindow::new() else { return };
         wire_chrome(&ui);
         view::wire(&ui);
+        pick::wire(&ui);
         friends::wire(&ui);
         downloads::wire(&ui);
         settings::wire(&ui);
@@ -425,6 +429,7 @@ impl Host {
             theme.set_scale(scale(&app));
             theme.set_small(small(&app));
             view::sync(&ui, &app);
+            pick::sync(&ui, &app);
             friends::sync(&ui, &app);
             downloads::sync(&ui, &app);
             settings::sync(&ui, &app);
@@ -449,6 +454,7 @@ impl Host {
         drop(shown);
         drop_native_icons();
         view::forget();
+        pick::forget();
         sky::forget();
         friends::forget();
         downloads::forget();

@@ -30,6 +30,9 @@ pub(crate) struct Snapshot {
     pub error: Option<String>,
     #[serde(default)]
     pub game_running: Option<bool>,
+    /// The running game lost its connection and shows its fatal dialog (`game_disconnected`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub connection_lost: bool,
     #[serde(default)]
     pub session_error: Option<String>,
     #[serde(default)]

@@ -188,21 +188,7 @@ pub(crate) fn admin_scratch(name: &str) -> std::io::Result<PathBuf> {
 /// The machine's ProgramData folder as the system records it (FOLDERID_ProgramData, read from
 /// HKLM), never from the environment.
 pub(crate) fn program_data() -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY};
-    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
-    // SAFETY: `raw` is an out-pointer; on return it is a NUL-terminated CoTaskMem string (or
-    // null), read before being freed exactly once.
-    unsafe {
-        let hr = SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DONT_VERIFY as u32, std::ptr::null_mut(), &mut raw);
-        let path = (hr >= 0 && !raw.is_null()).then(|| {
-            let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
-            PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len)))
-        });
-        CoTaskMemFree(raw as _);
-        path.filter(|p| p.is_absolute()).ok_or_else(|| std::io::Error::other(format!("no ProgramData folder (0x{hr:08X})")))
-    }
+    crate::win::known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_ProgramData)
 }
 
 /// Whether `dir` is owned by Administrators or SYSTEM, so no standard user can swap what is

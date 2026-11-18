@@ -64,7 +64,9 @@ fn parse_ucs_area(value: Option<&Value<'_>>, region: Region) -> Result<Option<St
 
 pub use crate::wire::{FRIENDS_LEN, FRIEND_RECORD_LEN, FRIEND_SLOTS};
 
-pub enum ServiceEvent { NativeStartGame, NativeBatchGame(String), NativeSignOut, NativeStatus { mode: i32, groups: bool }, NativePortrait(u16), NativeActivity, NativeSocial(NativeSocialRequest), ViewerCheck(ViewerCheckResult), NativePlayPending, ControllerSettings { id: u64, settings: FfxiSettings, deadline_ms: u64 }, GameShutdown { id: u64, game: u64, deadline_ms: u64 } }
+pub enum ServiceEvent { NativeStartGame, NativeBatchGame(String), NativeSignOut, NativeStatus { mode: i32, groups: bool }, NativePortrait(u16), NativeActivity, NativeSocial(NativeSocialRequest), ViewerCheck(ViewerCheckResult), NativePlayPending, ControllerSettings { id: u64, settings: FfxiSettings, deadline_ms: u64 }, GameShutdown { id: u64, game: u64, deadline_ms: u64 },
+    /// The controller buttons Crystal's pad hotkeys take now (`pad_hide`), replacing the last list.
+    PadHide(Vec<crate::pad_hide::Entry>) }
 
 /// The launcher's answer to `native_viewer_check`: the Viewer's own W2U
 /// (:54000) verdict for this Connect (pol-spec 07a w2u-at-connect, 07c §1).
@@ -200,6 +202,13 @@ pub fn parse_service_event(line: &[u8]) -> Result<Option<ServiceEvent>, ProtoErr
         }
         return Ok(Some(ServiceEvent::ControllerSettings { id, settings, deadline_ms }));
     }
+    if t.eq_str("pad_hide") {
+        let Value::Object(fields) = &root else { return Err(ProtoError::Field("pad_hide", "invalid command")); };
+        if fields.len() != 2 || !exactly_once(fields, &["type", "pad_hide"]) {
+            return Err(ProtoError::Field("pad_hide", "command fields must be unambiguous"));
+        }
+        return Ok(Some(ServiceEvent::PadHide(crate::pad_hide::parse(root.get("pad_hide"))?)));
+    }
     if t.eq_str("native_social") { return Ok(Some(ServiceEvent::NativeSocial(social_request(&root)?))); }
     if t.eq_str("native_start_game") { return Ok(Some(ServiceEvent::NativeStartGame)); }
     if t.eq_str("native_batch_game") {
@@ -256,6 +265,8 @@ pub struct Session {
     /// Press OK on the in-world disconnect dialog: the launcher's Recovery
     /// relaunches by itself. Absent = false.
     pub dismiss_disconnect: bool,
+    /// The controller buttons Crystal's pad hotkeys take (`pad_hide`). Absent = none.
+    pub pad_hide: Vec<crate::pad_hide::Entry>,
     /// Optional foreground-only navigation of the real game login menus.
     pub auto_login: AutoLogin,
     /// FFXI settings this process reads instead of the registry (`ffxi_settings`); `None`
@@ -463,8 +474,9 @@ pub fn parse_session(line: &[u8]) -> Result<Session, ProtoError> {
     let viewer_gaps = flag("viewer_gaps", false)?;
     let auto_away_minutes = auto_away_minutes(get("auto_away_minutes"))?;
     let dismiss_disconnect = flag("dismiss_disconnect", false)?;
+    let pad_hide = crate::pad_hide::parse(get("pad_hide"))?;
     let auto_login = parse_auto_login(get("auto_login"))?;
-    Ok(Session { region, ucs_area, install_dir, pol_install_dir, native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, auto_login, ffxi_settings })
+    Ok(Session { region, ucs_area, install_dir, pol_install_dir, native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, pad_hide, auto_login, ffxi_settings })
 }
 
 /// Viewer auto-Away minutes: 0 off, else 10..=60; absent = 10.
@@ -504,6 +516,7 @@ pub struct Unpark {
     pub viewer_gaps: bool,
     pub auto_away_minutes: u32,
     pub dismiss_disconnect: bool,
+    pub pad_hide: Vec<crate::pad_hide::Entry>,
 }
 
 impl fmt::Debug for Unpark {
@@ -527,10 +540,10 @@ impl Park {
     /// The session a direct `session` line with the same fields gives, so the
     /// parked path continues exactly like the cold one (07d §1.4).
     pub fn into_session(self, unpark: Unpark) -> Session {
-        let Unpark { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect } = unpark;
+        let Unpark { native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, pad_hide } = unpark;
         Session {
             region: self.region, ucs_area: self.ucs_area, install_dir: self.install_dir, pol_install_dir: self.pol_install_dir,
-            native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect,
+            native_auth, start_game, keep_session, viewer_gaps, auto_away_minutes, dismiss_disconnect, pad_hide,
             auto_login: self.auto_login, ffxi_settings: self.ffxi_settings,
         }
     }
@@ -542,7 +555,7 @@ const LEGACY_FIELDS: [&str; 5] = ["v_key", "auth_code", "account_id", "pol_recor
 /// except `native_auth`.
 const SECRET_FIELDS: [&str; 6] = ["v_key", "auth_code", "account_id", "pol_records", "content_ids", "native_auth"];
 /// Per-Play flags: only in `credentials` (or a direct `session`).
-const PLAY_FIELDS: [&str; 5] = ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes", "dismiss_disconnect"];
+const PLAY_FIELDS: [&str; 6] = ["start_game", "keep_session", "viewer_gaps", "auto_away_minutes", "dismiss_disconnect", "pad_hide"];
 /// Host fields: only in `park` (or a direct `session`).
 const HOST_FIELDS: [&str; 7] = ["region", "lang", "install_dir", "pol_install_dir", "ffxi_settings", "auto_login", "ucs_area"];
 
@@ -667,7 +680,7 @@ pub fn parse_credentials(line: &[u8]) -> Result<Unpark, ProtoError> {
     let auto_away_minutes = auto_away_minutes(get("auto_away_minutes"))?;
     let (start_game, keep_session) = (flag("start_game", true)?, flag("keep_session", false)?);
     Ok(Unpark { native_auth, start_game, keep_session, viewer_gaps: flag("viewer_gaps", false)?, auto_away_minutes,
-        dismiss_disconnect: flag("dismiss_disconnect", false)? })
+        dismiss_disconnect: flag("dismiss_disconnect", false)?, pad_hide: crate::pad_hide::parse(get("pad_hide"))? })
 }
 
 /// `ffxi_settings`: value name -> JSON number (`REG_DWORD`, -2^31..2^32-1) or string (`REG_SZ`).
@@ -730,9 +743,14 @@ pub fn started_line(pid: u32) -> String {
     format!("{{\"type\":\"started\",\"pid\":{pid}}}\n")
 }
 
-/// Local controller acknowledgement. Request zero advertises the scoped live service.
-pub fn game_shutdown_result(id: u64, game: u64, ok: bool, message: &str) -> String {
-    format!("{{\"type\":\"game_shutdown_result\",\"request_id\":{id},\"game_id\":{game},\"ok\":{ok},\"message\":{}}}\n", json_string(message))
+/// Local controller acknowledgement. Request zero advertises the scoped live service. `path`
+/// (accepted: `world` /shutdown, `dialog` the fatal dialog's OK) or `reason` (refused:
+/// `not_in_world`) say which branch answered; a launcher that does not know them ignores them.
+/// Not `code`: the launcher reads that name as a number in every message.
+pub fn game_shutdown_result(id: u64, game: u64, ok: bool, message: &str, path: Option<&str>, reason: Option<&str>) -> String {
+    let field = |name: &str, value: Option<&str>| value.map(|value| format!(",\"{name}\":{}", json_string(value))).unwrap_or_default();
+    format!("{{\"type\":\"game_shutdown_result\",\"request_id\":{id},\"game_id\":{game},\"ok\":{ok},\"message\":{}{}{}}}\n",
+        json_string(message), field("path", path), field("reason", reason))
 }
 
 pub fn controller_result(id: u64, ok: bool, message: &str) -> String {
@@ -748,6 +766,13 @@ pub fn game_disconnected_line(state: u32, code: i32) -> String {
 
 pub fn exit_line(code: i32) -> String {
     format!("{{\"type\":\"exit\",\"code\":{code}}}\n")
+}
+
+/// One of the host's key log lines (`key_log!`), for this game's log. A launcher that does not
+/// know the type ignores it.
+pub fn key_line(line: &str) -> String {
+    let line: String = line.chars().take(400).collect();
+    format!("{{\"type\":\"log\",\"line\":{}}}\n", json_string(&line))
 }
 
 pub fn error_line(message: &str) -> String {
@@ -793,9 +818,13 @@ mod tests {
             line.replace("\"request_id\":18446744073709551615", "\"request_id\":-1"),
             line.replace("\"deadline_ms\":1000", "\"deadline_ms\":1000,\"command\":\"/say unsafe\""),
         ] { assert!(parse_service_event(line.as_bytes()).is_err()); }
-        let reply=game_shutdown_result(1,7,true,"Requested");
+        let reply=game_shutdown_result(1,7,true,"Requested",Some("dialog"),None);
         let value=json::parse(reply.trim().as_bytes()).unwrap();
         assert_eq!(value.get("game_id"),Some(&Value::Number("7")));
+        assert_eq!(reply, "{\"type\":\"game_shutdown_result\",\"request_id\":1,\"game_id\":7,\"ok\":true,\"message\":\"Requested\",\"path\":\"dialog\"}\n");
+        assert_eq!(game_shutdown_result(2,7,false,"No",None,Some("not_in_world")),
+            "{\"type\":\"game_shutdown_result\",\"request_id\":2,\"game_id\":7,\"ok\":false,\"message\":\"No\",\"reason\":\"not_in_world\"}\n");
+        assert!(!game_shutdown_result(0,7,true,"",None,None).contains("path"), "the announcement is unchanged");
     }
 
     #[test]
@@ -1176,6 +1205,8 @@ mod tests {
         let park = PARK_LINE.strip_suffix('}').unwrap();
         assert!(parse_first_line(format!("{park},\"dismiss_disconnect\":true}}").as_bytes()).is_err(), "never in a park line");
         assert_eq!(game_disconnected_line(0x15, -2059), "{\"type\":\"game_disconnected\",\"state\":21,\"code\":-2059}\n");
+        assert_eq!(key_line("stage: game exited with code 0"), "{\"type\":\"log\",\"line\":\"stage: game exited with code 0\"}\n");
+        assert_eq!(key_line(&"x".repeat(500)).len(), "{\"type\":\"log\",\"line\":\"\"}\n".len() + 400);
     }
 
     /// Live 2026-11-15 (test builds 7, 8): character select never started. The launcher's
@@ -1224,6 +1255,30 @@ mod tests {
         let defaults = parse_credentials(format!("{{\"type\":\"credentials\",{}}}", native_fields()).as_bytes()).unwrap();
         assert!(defaults.start_game && !defaults.keep_session && !defaults.viewer_gaps && defaults.auto_away_minutes == 10);
         assert!(!format!("{defaults:?}").contains("fake password"));
+    }
+
+    #[test]
+    fn pad_hide_is_a_per_play_field_and_a_live_command() {
+        // Missing: nothing hidden, in a direct session and a parked host's Play.
+        assert!(parse_session(line(&native_fields()).as_bytes()).unwrap().pad_hide.is_empty());
+        assert!(parse_credentials(credentials_line("").as_bytes()).unwrap().pad_hide.is_empty());
+        let list = [[0, 0x20], [crate::pad_hide::LT, 0x10]];
+        let session = parse_session(line(&format!("{},\"pad_hide\":[[0,32],[65536,16]]", native_fields())).as_bytes()).unwrap();
+        assert_eq!(session.pad_hide, list);
+        let FirstLine::Park(park) = parse_first_line(PARK_LINE.as_bytes()).unwrap() else { panic!("not a park") };
+        let parked = park.into_session(parse_credentials(credentials_line(",\"pad_hide\":[[0,32],[65536,16]]").as_bytes()).unwrap());
+        assert_eq!(parked.pad_hide, list);
+        let park = PARK_LINE.strip_suffix('}').unwrap();
+        assert!(parse_first_line(format!("{park},\"pad_hide\":[]}}").as_bytes()).is_err(), "never in a park line");
+        assert!(parse_credentials(credentials_line(",\"pad_hide\":[[0,32]],\"pad_hide\":[]").as_bytes()).is_err());
+        assert!(parse_credentials(credentials_line(",\"pad_hide\":[[0,0]]").as_bytes()).is_err());
+        // The command replaces the list; an empty one hides nothing.
+        assert!(matches!(parse_service_event(br#"{"type":"pad_hide","pad_hide":[[0,1024]]}"#), Ok(Some(ServiceEvent::PadHide(l))) if l == [[0, 0x400]]));
+        assert!(matches!(parse_service_event(br#"{"type":"pad_hide","pad_hide":[]}"#), Ok(Some(ServiceEvent::PadHide(l))) if l.is_empty()));
+        for bad in [&br#"{"type":"pad_hide"}"#[..], br#"{"type":"pad_hide","pad_hide":[],"pad_hide":[]}"#, br#"{"type":"pad_hide","pad_hide":[],"x":1}"#,
+            br#"{"type":"pad_hide","pad_hide":7}"#] {
+            assert!(parse_service_event(bad).is_err());
+        }
     }
 
     #[test]

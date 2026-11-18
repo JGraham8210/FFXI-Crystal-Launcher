@@ -5,6 +5,7 @@
 import { Theme } from "theme.slint";
 import { View, Ink, AccountLine, RailNote } from "state.slint";
 import { Downloads } from "downloads_state.slint";
+import { Picking, PickBox, HeaderBox, SelectPanel } from "pick.slint";
 import { Nav, Glyph, Icon, Spinner, Pressable, SmallButton, Control, Tone, IconButton, Check, Select, ScrollThumb, KeyCap, Lamp, LampState, Face, CornerMask, Menu, QuietButton, TipBody } from "widgets.slint";
 
 /// The brand row: the crystal mark and the name. Its empty part is the title bar.
@@ -160,6 +161,13 @@ component RailRow inherits Rectangle {
     private property <bool> under: View.dragging && View.drag-y >= self.absolute-position.y
         && View.drag-y < self.absolute-position.y + self.height + Theme.rail-row-gap;
     changed under => { if self.under { View.drag-over(root.index); } }
+    // A paint drag's pointer is over this row: it takes the drag's value.
+    private property <bool> paint-under: Picking.painting && View.drag-y >= self.absolute-position.y
+        && View.drag-y < self.absolute-position.y + self.height + Theme.rail-row-gap;
+    changed paint-under => { if self.paint-under { Picking.over(root.index); } }
+    /// The keyboard's row (Up, Down), while the rail has the focus.
+    in property <bool> cursor;
+    callback picked();
     private property <bool> off: root.line.lamp == LampState.off;
     // A code row with its button beside the boxes.
     private property <bool> otp-button: root.line.otp && root.line.action != "" && !root.line.action-soft;
@@ -251,7 +259,9 @@ component RailRow inherits Rectangle {
                         color: Theme.sub;
                         vertical-alignment: center;
                     }
-                    Check {
+                    // A press starts a paint drag over the other boxes (Shift: a range); Space and
+                    // Return toggle it from the keyboard.
+                    PickBox {
                         cross-axis-self-alignment: center;
                         box: 18px;
                         width: 18px;
@@ -259,6 +269,7 @@ component RailRow inherits Rectangle {
                         label: root.line.name;
                         checked: root.line.checked;
                         toggled(on) => { View.toggle-account(root.index, on); }
+                        pressed(shift) => { Picking.press(root.index, shift); root.picked(); }
                     }
                 }
                 HorizontalLayout {
@@ -340,6 +351,11 @@ component RailRow inherits Rectangle {
                 }
             }
         }
+    }
+    if root.cursor: Rectangle {
+        border-width: 2px;
+        border-color: Theme.accent;
+        border-radius: Theme.radius;
     }
 }
 
@@ -664,8 +680,33 @@ export component AccountRail inherits Rectangle {
                 padding-right: 12px;
                 spacing: 10px;
                 Text { text: View.strings.accounts; font-size: Theme.type-small; font-weight: 600; color: Theme.ink2; vertical-alignment: center; }
-                if View.accounts.length > 0: Text { text: View.accounts-note; font-size: Theme.type-note; color: Theme.faint; vertical-alignment: center; }
-                Rectangle { horizontal-stretch: 1; }
+                // Pick all or none, and the Select menu beside it.
+                if View.accounts.length > 0: HorizontalLayout {
+                    spacing: 2px;
+                    HeaderBox {
+                        cross-axis-self-alignment: center;
+                        state: Picking.state;
+                        label: Picking.strings.select;
+                        clicked => { Picking.toggle-all(); }
+                    }
+                    IconButton {
+                        cross-axis-self-alignment: center;
+                        side: 22px;
+                        glyph: Glyph.chevron-down;
+                        glyph-size: 14px;
+                        hint: Picking.strings.select;
+                        clicked => { Picking.open = !Picking.open; }
+                    }
+                }
+                if View.accounts.length > 0: Text {
+                    horizontal-stretch: 1;
+                    text: View.accounts-note;
+                    font-size: Theme.type-note;
+                    color: Theme.faint;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                if View.accounts.length == 0: Rectangle { horizontal-stretch: 1; }
                 HorizontalLayout {
                     spacing: 0px;
                     IconButton {
@@ -710,8 +751,58 @@ export component AccountRail inherits Rectangle {
                 ink: View.tone(Ink.warn-tone);
             }
         }
-        if View.accounts.length > 0: Rectangle {
+        // The rows hold the keyboard focus (Tab, or a press on a checkbox): Up and Down move the
+        // row, Space picks it, Shift extends, Ctrl+A / Ctrl+Shift+A / Ctrl+I pick all, none, invert.
+        if View.accounts.length > 0: keys := FocusScope {
             vertical-stretch: 1;
+            // Not a Tab stop of its own: Tab lands on the rows' controls, whose keys come here
+            // when they take none. A press on a checkbox focuses it.
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+            enabled: !Nav.modal;
+            private property <int> cursor: -1;
+            private property <int> at: min(self.cursor, View.accounts.length - 1);
+            /// Scrolls the list just far enough to show row `row`.
+            function reveal(row: int) {
+                let top = 2px + row * (Theme.rail-row-h + root.gap);
+                let bottom = top + Theme.rail-row-h;
+                if top + flick.content-y < 0px { flick.content-y = -top; }
+                if bottom + flick.content-y > flick.height { flick.content-y = flick.height - bottom; }
+            }
+            key-pressed(event) => {
+                if event.text == Key.UpArrow || event.text == Key.DownArrow {
+                    let to = self.at < 0 ? 0 : clamp(self.at + (event.text == Key.UpArrow ? -1 : 1), 0, View.accounts.length - 1);
+                    if event.modifiers.shift { Picking.extend(max(self.at, 0), to); }
+                    self.cursor = to;
+                    self.reveal(to);
+                    return accept;
+                }
+                if event.text == " " && self.at >= 0 {
+                    View.toggle-account(self.at, !View.accounts[self.at].checked);
+                    return accept;
+                }
+                if event.modifiers.control && (event.text == "a" || event.text == "A" || event.text == "\u{1}") {
+                    Picking.pick(event.modifiers.shift ? 1 : 0, false);
+                    return accept;
+                }
+                if event.modifiers.control && (event.text == "i" || event.text == "I") {
+                    Picking.pick(2, false);
+                    return accept;
+                }
+                return reject;
+            }
+            // While a paint drag runs, a pointer near the list's top or bottom edge scrolls it.
+            Timer {
+                interval: 16ms;
+                running: Picking.painting;
+                triggered => {
+                    let rel = View.drag-y - flick.absolute-position.y;
+                    let zone = 40px;
+                    let dy = rel < zone ? (zone - min(rel, zone)) / zone * 14px
+                        : rel > flick.height - zone ? -(min(rel - (flick.height - zone), zone)) / zone * 14px : 0px;
+                    flick.content-y = max(min(0px, flick.height - flick.content-height), min(0px, flick.content-y + dy));
+                }
+            }
             flick := Flickable {
                 // The wheel scrolls; a mouse drag is a row drag, not a pan (a pan steals the grip's press).
                 mouse-drag-pan-enabled: false;
@@ -727,6 +818,8 @@ export component AccountRail inherits Rectangle {
                     for line[index] in View.accounts: RailRow {
                         line: line;
                         index: index;
+                        cursor: keys.has-focus && keys.at == index;
+                        picked => { keys.cursor = index; keys.focus(); }
                     }
                     // Add account (`.add`).
                     add := Pressable {
@@ -758,4 +851,12 @@ export component AccountRail inherits Rectangle {
     }
     // The rail's right edge.
     Rectangle { x: parent.width - 1px; width: 1px; background: Theme.hairline; }
+    // The Select menu, under the header; a click anywhere else closes it.
+    if Picking.open: TouchArea { clicked => { Picking.open = false; } }
+    if Picking.open: SelectPanel {
+        x: 8px;
+        y: header.absolute-position.y - root.absolute-position.y + header.height + 2px;
+        width: root.width - 16px;
+        room: root.height - self.y - 12px;
+    }
 }

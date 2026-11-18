@@ -13,6 +13,9 @@ use slint::ComponentHandle;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+#[path = "pick_tests.rs"]
+mod pick_tests;
+
 const SECRETS: [&str; 15] = [
     "Main account", "Second account", "Crafting account", "ABC12340", "ABC12341",
     "Alyria", "Balthier", "Celestine", "Haruko", "Nocturne", "Mallory", "Rook", "Lyrielle", "Ardent",
@@ -48,6 +51,7 @@ fn main_window() -> (MainWindow, Rc<MinimalSoftwareWindow>) {
     let window = headless::window(1440, 900);
     let ui = MainWindow::new().unwrap();
     super::view::wire(&ui);
+    super::pick::wire(&ui);
     super::friends::wire(&ui);
     super::downloads::wire(&ui);
     super::settings::wire(&ui);
@@ -60,6 +64,7 @@ fn main_window() -> (MainWindow, Rc<MinimalSoftwareWindow>) {
 /// Syncs every page's view model to `app` and draws a frame (which builds the shown items).
 fn render(ui: &MainWindow, window: &MinimalSoftwareWindow, app: &App) -> Vec<String> {
     super::view::sync(ui, app);
+    super::pick::sync(ui, app);
     super::friends::sync(ui, app);
     super::downloads::sync(ui, app);
     super::settings::sync(ui, app);

@@ -89,7 +89,7 @@ pub(crate) fn default_path() -> PathBuf {
 }
 
 pub(crate) fn path_for(config: &crate::backend::Config) -> PathBuf {
-    config.experiment.join("iced-launcher/official-versions.json")
+    config.layout().official_versions()
 }
 
 pub(crate) fn load(path: &Path) -> Store {

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 #[path = "hardware.rs"]
 mod hardware;
 #[path = "hid.rs"]
-mod hid;
+pub(crate) mod hid;
 
 /// Vendor/product ids from a PnP instance id or HID interface path: USB
 /// `VID_054C&PID_0CE6`, Bluetooth `VID&0002054C_PID&0CE6` (a vendor-id

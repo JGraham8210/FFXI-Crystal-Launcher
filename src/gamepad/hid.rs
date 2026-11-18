@@ -37,6 +37,8 @@ pub(super) fn link(path: &str) -> Link {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct Reading {
     pub input: Input,
+    /// L2 and R2 as reported, 0..=255 (the pad hotkeys count 128 and up as pressed).
+    pub triggers: [u8; 2],
     pub battery: Option<u8>,
     pub state: BatteryState,
 }
@@ -112,9 +114,9 @@ pub(super) fn parse(family: Family, link: Link, r: &[u8]) -> Option<Reading> {
         if r.len() <= battery_at {
             return None;
         }
-        let input = if dualsense { input(r, o, o + 7, o + 4, true) } else { input(r, o, o + 4, o + 7, false) };
+        let (input, t) = if dualsense { (input(r, o, o + 7, o + 4, true), o + 4) } else { (input(r, o, o + 4, o + 7, false), o + 7) };
         let (battery, state) = battery(family, r[battery_at]);
-        Some(Reading { input, battery, state })
+        Some(Reading { input, triggers: [r[t], r[t + 1]], battery, state })
     };
     match (dualsense, link, *r.first()?) {
         (true, Link::Usb, 0x01) => full(1, 53),
@@ -122,14 +124,15 @@ pub(super) fn parse(family: Family, link: Link, r: &[u8]) -> Option<Reading> {
         (false, Link::Usb, 0x01) => full(1, 30),
         (false, Link::Bluetooth, 0x11) => full(3, 32),
         // Bluetooth basic mode, the same layout on both pads; no battery.
-        (_, Link::Bluetooth, 0x01) if r.len() >= 10 => Some(Reading { input: input(r, 1, 5, 8, false), ..Reading::default() }),
+        (_, Link::Bluetooth, 0x01) if r.len() >= 10 => Some(Reading { input: input(r, 1, 5, 8, false), triggers: [r[8], r[9]], ..Reading::default() }),
         _ => None,
     }
 }
 
-/// Open HID pads, keyed by interface path, polled from the controller worker.
+/// Open HID pads, keyed by interface path, polled from the controller worker (and, an
+/// instance of its own, from the pad hotkeys' reader).
 #[derive(Default)]
-pub(super) struct HidPads {
+pub(crate) struct HidPads {
     devices: Vec<win::Device>,
     next_id: usize,
 }
@@ -144,7 +147,7 @@ const FIRST_ID: usize = 1 << 16;
 
 impl HidPads {
     /// Opens newly present pads and drops removed ones. True when the set changed.
-    pub(super) fn refresh(&mut self) -> bool {
+    pub(crate) fn refresh(&mut self) -> bool {
         let paths = win::interfaces();
         let before = self.devices.len();
         self.devices.retain(|d| d.alive && paths.contains(&d.path));
@@ -166,8 +169,13 @@ impl HidPads {
         changed
     }
 
+    /// Each open pad's id and buttons now (`Btn::bit`s), its triggers pressed at 128 of 255.
+    pub(crate) fn buttons(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        self.devices.iter().map(|d| (d.id(), buttons_of(&d.reading())))
+    }
+
     /// Drains pending reports. True when any pad's state changed or one went away.
-    pub(super) fn poll(&mut self) -> bool {
+    pub(crate) fn poll(&mut self) -> bool {
         let mut changed = false;
         for device in &mut self.devices {
             changed |= device.pump();
@@ -183,6 +191,14 @@ impl HidPads {
         let keep = unlisted(self.devices.iter().map(|d| d.pid), listed);
         self.devices.iter().zip(keep).filter(|(_, k)| *k).map(|(d, _)| d.pad()).collect()
     }
+}
+
+/// A reading's buttons for the pad hotkeys: L2 and R2 pressed at 128 of 255 (the threshold the
+/// loader's filter uses), not past the half travel the controller page shows.
+fn buttons_of(reading: &Reading) -> u32 {
+    let triggers = Btn::LT.bit() | Btn::RT.bit();
+    let pressed = |raw: u8, b: Btn| if raw >= 128 { b.bit() } else { 0 };
+    reading.input.buttons & !triggers | pressed(reading.triggers[0], Btn::LT) | pressed(reading.triggers[1], Btn::RT)
 }
 
 /// For each HID pad (by Sony product id): true when no remaining gilrs pad
@@ -364,12 +380,17 @@ mod win {
                 self.pending = false;
                 let len = (read as usize).min(self.buf.len());
                 if let Some(reading) = parse(self.family, self.link, &self.buf[..len]) {
-                    changed |= reading != self.reading;
+                    // The raw trigger bytes alone are no change for the controller page.
+                    changed |= Reading { triggers: self.reading.triggers, ..reading } != self.reading;
                     self.reading = reading;
                 }
             }
             changed
         }
+
+        pub(super) fn id(&self) -> usize { self.id }
+
+        pub(super) fn reading(&self) -> Reading { self.reading }
 
         pub(super) fn pad(&self) -> Pad {
             let wireless = self.link == Link::Bluetooth || self.pid == 0x0BA0;
@@ -495,6 +516,21 @@ mod tests {
         for pad in pads.pads(&[]) {
             println!("{pad:?}\n  {} · {}", pad.family.label(), pad.connection());
         }
+    }
+
+    #[test]
+    fn gamepad_hid_pad_hotkeys_count_a_trigger_from_128() {
+        let mut r = BT_BASIC_IDLE;
+        (r[8], r[9]) = (128, 127);
+        let reading = parse(Family::DualShock4, Link::Bluetooth, &r).unwrap();
+        assert_eq!(reading.triggers, [128, 127]);
+        assert!(!reading.input.pressed(Btn::LT), "the controller page: past half travel");
+        assert_eq!(buttons_of(&reading), Btn::LT.bit());
+        let mut usb = [0u8; 64];
+        usb[0] = 0x01;
+        (usb[5], usb[6]) = (200, 0);
+        let reading = parse(Family::DualSense, Link::Usb, &usb).unwrap();
+        assert_eq!((reading.triggers, buttons_of(&reading) & Btn::LT.bit()), ([200, 0], Btn::LT.bit()));
     }
 
     #[test]

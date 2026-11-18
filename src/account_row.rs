@@ -41,7 +41,7 @@ pub(crate) fn needs_code(app: &App, item: &crate::AccountRow) -> bool {
 }
 /// Which state an account row shows, in priority order (its colour needs only this).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RowState { Closing, Waiting, Updating, ViewerConfirm, ViewerUpdating, Playing, Starting, SigningIn, SignedIn, Private, Relaunching, NeedsCode, Problem, Idle }
+pub(crate) enum RowState { Closing, Waiting, Updating, ViewerConfirm, ViewerUpdating, ConnectionLost, Playing, Starting, SigningIn, SignedIn, Private, Relaunching, NeedsCode, Problem, Idle }
 pub(crate) fn row_state(app: &App, item: &crate::AccountRow) -> RowState {
     if item.shutting_down || item.signing_out {
         RowState::Closing
@@ -53,6 +53,8 @@ pub(crate) fn row_state(app: &App, item: &crate::AccountRow) -> RowState {
         RowState::ViewerConfirm
     } else if !item.busy && app.viewer_update_of(&item.key).is_some() {
         RowState::ViewerUpdating
+    } else if item.connection_lost() {
+        RowState::ConnectionLost
     } else if item.is_playing() {
         RowState::Playing
     } else if item.game_start_pending() {
@@ -122,15 +124,22 @@ pub(crate) fn row_view(app: &App, item: &crate::AccountRow) -> RowView {
             }
             row
         }
-        RowState::Playing => {
+        RowState::Playing | RowState::ConnectionLost => {
             let since = item
                 .play_timing
                 .as_ref()
                 .map(|timing| tf("since {time}", &[("time", &clock_at(timing.started()))]))
                 .unwrap_or_default();
-            let mut row = view(t("In game").into(), since);
+            let label = if state == RowState::ConnectionLost { t("Connection lost") } else { t("In game") };
+            // A shut-down that stayed open in the world says why and offers Close now.
+            let detail = if item.closing.close_now { item.status_text().into_owned() } else { since };
+            let mut row = view(label.into(), detail);
             if item.can_shut_down() {
-                row.action = Some((t("Shut down").into(), Message::ShutdownAccount(item.key.clone()), false));
+                row.action = Some(if item.closing.close_now {
+                    (t("Close now").into(), Message::CloseNow(item.key.clone()), false)
+                } else {
+                    (t("Shut down").into(), Message::ShutdownAccount(item.key.clone()), false)
+                });
             }
             row
         }
@@ -328,7 +337,7 @@ mod tests {
         app.accounts[2].problem = true;
         app.accounts[2].status = t("Game closed after losing its connection").into();
         assert_eq!(row_view(&app, &app.accounts[2]).label, t("Game closed after losing its connection"));
-        let lost = crate::launch_log::ExitReport { kind: crate::launch_log::ExitKind::Disconnected, exit_status: None, during_startup: false, summary: String::new() };
+        let lost = crate::launch_log::ExitReport { kind: crate::launch_log::ExitKind::Disconnected, exit_status: None, during_startup: false, crash_dump: false, summary: String::new() };
         runtime.game_started(crate::features::runtime::GameStart { account: key.clone(), slot: None, label: String::new(), pid: std::process::id() });
         runtime.game_ended(crate::features::runtime::GameEnd { account: key.clone(), report: Some(lost), user_closed: false, maintenance: false });
         assert_eq!(row_state(&app, &app.accounts[2]), RowState::Relaunching);

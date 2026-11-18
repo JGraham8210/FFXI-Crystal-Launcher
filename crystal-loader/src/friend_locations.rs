@@ -36,8 +36,6 @@ pub(crate) const ZONE: usize = 0xd8;
 pub(crate) const PRIVACY: usize = 0xe0;
 pub(crate) const HIDDEN_BIT: usize = 14;
 pub(crate) const COMPLETED: usize = 0xfc;
-/// [OWN_ZONE] + 0x3c350 is my own zone (101eaf3f/101eaf4d).
-pub(crate) const OWN_ZONE_FIELD: usize = 0x3c350;
 /// 101cbc10(zone, 0): group 4 (area names), else group 9 index 0x40.
 pub(crate) const AREA_GROUP: usize = 4;
 pub(crate) const FALLBACK_GROUP: usize = 9;
@@ -119,8 +117,11 @@ fn verified(base: usize, reader: &Reader<'_>, layout: &Friends) -> Option<()> {
     own[2..].copy_from_slice(&relocated(layout.own_zone)?);
     // 101cbc3a: the group 9, index 0x40 fallback.
     let fallback = [0xc7, 0x44, 0x24, 8, 0x40, 0, 0, 0, 0xc7, 0x44, 0x24, 4, 9, 0, 0, 0];
+    // mov edx, [ecx + own zone field]
+    let mut field = [0x8b, 0x91, 0, 0, 0, 0];
+    field[2..].copy_from_slice(&u32::try_from(layout.own_zone_field).ok()?.to_le_bytes());
     if read::<6>(reader, at(layout.display_area + 0x1d)?)? != own
-        || read::<6>(reader, at(layout.display_area + 0x2b)?)? != [0x8b, 0x91, 0x50, 0xc3, 3, 0]
+        || read::<6>(reader, at(layout.display_area + 0x2b)?)? != field
         || read::<16>(reader, at(layout.area_fn + 0x2a)?)? != fallback
     {
         return None;
@@ -264,11 +265,11 @@ fn selected(record: &[u8]) -> Option<&[u8]> {
     (character[0] & 1 != 0 && character[2..4] == [1, 0]).then_some(character)
 }
 
-/// My own zone ([OWN_ZONE] + 0x3c350), or None when that object is absent.
+/// My own zone ([OWN_ZONE] + the scanned field), or None when that object is absent.
 fn own_zone(base: usize, layout: &Friends, reader: &Reader<'_>) -> Option<usize> {
     let object = dword(reader, base.checked_add(layout.own_zone)?)?;
     (object != 0).then_some(())?;
-    dword(reader, object.checked_add(OWN_ZONE_FIELD)?)
+    dword(reader, object.checked_add(layout.own_zone_field)?)
 }
 
 /// 101eaec0, same-world branch. The row's +0xb0..+0xf8 is copied; its word
@@ -616,7 +617,7 @@ mod tests {
             f.put(DATA + 32, b"Bastok Markets\0");
             // I am in zone 5; the friend's row says zone 1.
             f.memory.insert(BASE + L.own_zone, (ZONE as u32).to_le_bytes().to_vec());
-            f.memory.insert(ZONE + OWN_ZONE_FIELD, 5u32.to_le_bytes().to_vec());
+            f.memory.insert(ZONE + L.own_zone_field, 5u32.to_le_bytes().to_vec());
             // Group 9 (managed), index 0x40.
             f.memory.insert(BASE + L.fallback.object, vec![0; 16]);
             f.put(BASE + L.fallback.object + 4, &(FALLBACK_HEADER as u32).to_le_bytes());
@@ -714,12 +715,19 @@ mod tests {
     #[test]
     fn the_area_is_hidden_only_in_my_own_zone_or_without_my_zone() {
         let mut f = Fixture::new();
-        f.put(ZONE + OWN_ZONE_FIELD, &1u32.to_le_bytes());
+        f.put(ZONE + L.own_zone_field, &1u32.to_le_bytes());
         assert!(f.locations()[24..88].iter().all(|b| *b == 0));
         assert_eq!(&f.locations()[8..14], b"Alice\0");
-        f.put(ZONE + OWN_ZONE_FIELD, &5u32.to_le_bytes());
+        f.put(ZONE + L.own_zone_field, &5u32.to_le_bytes());
         f.put(BASE + L.own_zone, &0u32.to_le_bytes());
         assert!(f.locations()[24..88].iter().all(|b| *b == 0));
+        // A layout with another own-zone field reads my zone from there.
+        f.put(BASE + L.own_zone, &(ZONE as u32).to_le_bytes());
+        let moved = Friends { own_zone_field: 0x3c400, ..L };
+        f.memory.insert(ZONE + 0x3c400, 1u32.to_le_bytes().to_vec());
+        let hidden = copy_locations(BASE, &moved, &f.native, &|a, b| f.read(a, b)).unwrap();
+        assert!(hidden[24..88].iter().all(|b| *b == 0), "my zone 1 equals the friend's");
+        assert_eq!(&f.locations()[24..39], b"Bastok Markets\0", "the 0x3c350 layout still reads zone 5");
     }
     #[test]
     fn a_missing_area_name_uses_the_group_9_fallback() {
@@ -856,6 +864,13 @@ mod tests {
         assert!(verified(BASE, &|a, b| f.read(a, b), &L).is_none(), "group table must map 9");
         f.put(BASE + L.group_table + 3 * 8, &9u32.to_le_bytes());
         assert!(verified(BASE, &|a, b| f.read(a, b), &L).is_some());
+        // The own-zone field is the scanned one (6AE818B4 moved it to 0x3c400).
+        let moved_field = Friends { own_zone_field: 0x3c400, ..L };
+        assert!(verified(BASE, &|a, b| f.read(a, b), &moved_field).is_none());
+        f.put(BASE + L.display_area + 0x2b, &[0x8b, 0x91, 0x00, 0xc4, 3, 0]);
+        assert!(verified(BASE, &|a, b| f.read(a, b), &moved_field).is_some());
+        assert!(verified(BASE, &|a, b| f.read(a, b), &L).is_none());
+        f.put(BASE + L.display_area + 0x2b, &[0x8b, 0x91, 0x50, 0xc3, 3, 0]);
         f.put(BASE + 0x84, &0x8664u16.to_le_bytes());
         assert!(verified(BASE, &|a, b| f.read(a, b), &L).is_none());
         f.put(BASE + 0x84, &0x14cu16.to_le_bytes());

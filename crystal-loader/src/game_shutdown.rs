@@ -3,6 +3,8 @@
 //! setting decides whether POL stays signed in after the game returns. The
 //! command entry and the globals it reads come from game_layout's signature
 //! scan (any client build), re-checked in live memory before each call.
+//! Outside the world the request presses OK on a fatal-error dialog (the game
+//! then ends), or answers `not_in_world` so the launcher ends the host itself.
 use crate::{game_layout::Resolution, log};
 use std::{
     ffi::c_void,
@@ -29,6 +31,8 @@ use crate::game_layout::{
     controls::{SHUTDOWN_BODY, SHUTDOWN_CALLER, SHUTDOWN_CALLER_CALL as CALLER_CALL, SHUTDOWN_CALLER_LEN, SHUTDOWN_COMMAND, SHUTDOWN_PROLOGUE},
     Shutdown,
 };
+use crate::auto_login::Tap;
+use crate::disconnect::DialogOk;
 use crate::sigscan::Pattern;
 const UNAVAILABLE: &str = "Background shutdown is unavailable for this game session. Launch it again with the current Crystal build.";
 const EXPIRED: &str = "The shutdown request expired before the game could run it.";
@@ -175,13 +179,50 @@ impl Request {
 struct State {
     game: u64,
     layout: Option<Layout>,
+    /// The fatal-error dialog's OK; `None` where its menus or input did not resolve.
+    dialog: Option<DialogOk>,
     pending: Option<Request>,
     last_attempt: Option<Instant>,
 }
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 static EXECUTING: Mutex<()> = Mutex::new(());
 fn result(id: u64, game: u64, ok: bool, message: &str) {
-    crate::events::send(crate::proto::game_shutdown_result(id, game, ok, message));
+    crate::events::send(crate::proto::game_shutdown_result(id, game, ok, message, None, None));
+}
+
+/// Which branch a request takes in the game's current state.
+#[derive(Debug, PartialEq, Eq)]
+enum Branch {
+    /// In the world: the game's own /shutdown.
+    World,
+    /// A fatal network stop with its "ok" menu focused: OK was pressed (`Sent`) or not.
+    Dialog(Tap),
+    /// The title screen, the lobby, or a state not read.
+    NotInWorld,
+}
+/// `press` runs only outside the world, on the game thread.
+fn branch(in_world: bool, press: impl FnOnce() -> Option<Tap>) -> Branch {
+    if in_world { return Branch::World; }
+    match press() {
+        Some(Tap::Sent) => Branch::Dialog(Tap::Sent),
+        Some(other) => { log!("game shutdown: the fatal dialog's OK was not pressed ({other:?})"); Branch::NotInWorld }
+        None => Branch::NotInWorld,
+    }
+}
+const WORLD_REQUESTED: &str = "Shutdown requested. Waiting for FFXI and PlayOnline to close.";
+const DIALOG_PRESSED: &str = "Pressed OK on the game's error. Waiting for FFXI to close.";
+const NOT_IN_WORLD: &str = "No character is in the world.";
+/// The reply line's fields for an answered branch: ok, message, path, reason.
+fn reply(branch: &Branch) -> (bool, &'static str, Option<&'static str>, Option<&'static str>) {
+    match branch {
+        Branch::World => (true, WORLD_REQUESTED, Some("world"), None),
+        Branch::Dialog(_) => (true, DIALOG_PRESSED, Some("dialog"), None),
+        Branch::NotInWorld => (false, NOT_IN_WORLD, None, Some("not_in_world")),
+    }
+}
+fn answer(request: Request, branch: &Branch) {
+    let (ok, message, path, reason) = reply(branch);
+    crate::events::send(crate::proto::game_shutdown_result(request.id, request.game, ok, message, path, reason));
 }
 pub(crate) fn submit(id: u64, game: u64, deadline: u64) {
     let request = Request { id, game, deadline };
@@ -239,6 +280,13 @@ pub(crate) fn on_input(data: *mut u8) {
         result(request.id, request.game, false, EXPIRED);
         return;
     }
+    let dialog = state.dialog;
+    let branch = branch(layout.in_game(), || dialog.and_then(|dialog| dialog.press_now()));
+    if branch != Branch::World {
+        if branch == Branch::Dialog(Tap::Sent) { log!("game shutdown: pressed OK on the fatal dialog"); }
+        answer(request, &branch);
+        return;
+    }
     let lease = match layout.verify() {
         Ok(lease) => lease,
         Err(error) => {
@@ -246,15 +294,6 @@ pub(crate) fn on_input(data: *mut u8) {
             return;
         }
     };
-    if !layout.in_game() {
-        result(
-            request.id,
-            request.game,
-            false,
-            "Log into a character before requesting shutdown from Crystal.",
-        );
-        return;
-    }
     if !request.valid(state.game, unsafe { GetTickCount64() }) {
         result(request.id, request.game, false, EXPIRED);
         return;
@@ -266,12 +305,7 @@ pub(crate) fn on_input(data: *mut u8) {
         invoke(layout.base + layout.shutdown.entry);
     }
     drop(lease);
-    result(
-        request.id,
-        request.game,
-        true,
-        "Shutdown requested. Waiting for FFXI and PlayOnline to close.",
-    );
+    answer(request, &branch);
 }
 
 pub(crate) struct Worker {
@@ -291,6 +325,7 @@ impl Worker {
         *guard = Some(State {
             game,
             layout: None,
+            dialog: None,
             pending: None,
             last_attempt: None,
         });
@@ -317,6 +352,9 @@ impl Worker {
                     };
                     match resolved {
                         Ok((layout, lease)) => {
+                            state.dialog = DialogOk::resolve(resolution)
+                                .map_err(|reason| log!("note: shutdown cannot press OK on a fatal dialog: {reason}"))
+                                .ok();
                             state.layout = Some(layout);
                             hook = Some(lease);
                             result(0, game, true, "");
@@ -392,6 +430,24 @@ mod tests {
         globals[s.context / 4] = 0;
         assert!(!layout.in_game());
     }
+    /// In the world /shutdown, never a key; a fatal dialog's OK pressed once; anything else
+    /// answers `not_in_world` so the launcher ends the host.
+    #[test]
+    fn game_shutdown_takes_the_world_dialog_or_not_in_world_branch() {
+        assert_eq!(branch(true, || panic!("no key in the world")), Branch::World);
+        assert_eq!(reply(&Branch::World), (true, WORLD_REQUESTED, Some("world"), None));
+        let mut presses = 0;
+        assert_eq!(branch(false, || { presses += 1; Some(Tap::Sent) }), Branch::Dialog(Tap::Sent));
+        assert_eq!(presses, 1);
+        assert_eq!(reply(&Branch::Dialog(Tap::Sent)), (true, DIALOG_PRESSED, Some("dialog"), None));
+        for press in [None, Some(Tap::Skipped), Some(Tap::Failed), Some(Tap::Cancelled)] {
+            let taken = branch(false, move || press);
+            assert_eq!(taken, Branch::NotInWorld);
+            assert_eq!(reply(&taken), (false, NOT_IN_WORLD, None, Some("not_in_world")));
+        }
+        let line = crate::proto::game_shutdown_result(3, 7, false, NOT_IN_WORLD, None, Some("not_in_world"));
+        assert!(line.contains("\"reason\":\"not_in_world\"") && !line.contains("\"path\""));
+    }
     #[test]
     fn game_shutdown_rejects_expired_duplicate_and_foreign_game_requests() {
         assert!(Request { id: 1, game: 7, deadline: 1500 }.valid(7, 1000));
@@ -409,6 +465,7 @@ mod tests {
         *STATE.lock().unwrap() = Some(State {
             game: 7,
             layout: Some(Layout { base: 0, window: 0, keyboard: 0, shutdown: known() }),
+            dialog: None,
             pending: None,
             last_attempt: None,
         });

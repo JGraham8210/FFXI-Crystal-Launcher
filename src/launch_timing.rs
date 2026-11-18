@@ -6,7 +6,7 @@
 //!
 //! Output has three shapes:
 //! - one compact line per mark for the launch's own log (`unwritten_lines`),
-//! - a one-line summary for `launch-history.log` (`summary`): each phase's own duration,
+//! - a one-line summary for `history.log` (`summary`): each phase's own duration,
 //!   ending with the total from the click, e.g. `sign-in 2.8s, tool 0.4s, hello 1.9s,
 //!   game started 9.4s`,
 //! - a short line for the account row (`row_summary`), both figures from the click:
@@ -14,7 +14,7 @@
 
 use crate::i18n::tf;
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -404,14 +404,6 @@ pub fn noted(outcome: &str, summary: &str) -> String {
     }
 }
 
-/// Where a native client's timing lines go: beside its stderr log, never inside it (the
-/// client owns that file and the exit classifier reads its tail).
-pub fn sibling_path(stderr_log: &Path) -> PathBuf {
-    let name = stderr_log.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let stem = name.strip_suffix(".stderr.log").unwrap_or_else(|| name.strip_suffix(".log").unwrap_or(&name));
-    stderr_log.with_file_name(format!("{stem}.timing.log"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,19 +582,10 @@ mod tests {
     }
 
     #[test]
-    fn native_timing_file_sits_beside_the_stderr_log() {
-        assert_eq!(
-            sibling_path(Path::new(r"C:\d\logs\abc.stderr.log")),
-            PathBuf::from(r"C:\d\logs\abc.timing.log")
-        );
-        assert_eq!(sibling_path(Path::new(r"C:\d\logs\abc.log")), PathBuf::from(r"C:\d\logs\abc.timing.log"));
-    }
-
-    #[test]
     fn append_writes_each_mark_once() {
         let dir = std::env::temp_dir().join(format!("xi-launch-timing-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let path = dir.join("logs").join("a.timing.log");
+        let path = dir.join("logs").join("a.log");
         let mut t = timeline(&[(2800, Milestone::SignInDone)]);
         t.append_to(&path);
         t.append_to(&path);

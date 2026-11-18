@@ -110,8 +110,13 @@ impl Stage {
     }
 }
 
+/// `Cache\updates`: staged downloads and the last failed install's note.
+fn updates_dir(data: &Path) -> PathBuf {
+    crate::storage::Layout::at(data).updates()
+}
+
 fn last_error_path(data: &Path) -> PathBuf {
-    data.join("launcher-updates").join("last-error.txt")
+    updates_dir(data).join("last-error.txt")
 }
 
 pub(crate) fn initial(config: &Config) -> State {
@@ -165,7 +170,7 @@ fn load_stage(directory: &Path, key: &[u8; 32], current: &semver::Version) -> Re
 /// The newest staged download that still verifies (`load_stage`), if any.
 fn staged(data: &Path, key: &[u8; 32], current: &semver::Version) -> Option<Stage> {
     let mut best: Option<Stage> = None;
-    for entry in fs::read_dir(data.join("launcher-updates")).ok()?.flatten() {
+    for entry in fs::read_dir(updates_dir(data)).ok()?.flatten() {
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
@@ -242,9 +247,9 @@ fn clear_last_error(data: &Path) {
 
 /// Best effort: staging folders from earlier runs (all but `keep`, the verified download
 /// reused), and package backups beside the exe once no failure needs them; a backup whose
-/// restore failed is never removed. Root-level notes in launcher-updates stay.
+/// restore failed is never removed. Root-level notes in the updates folder stay.
 fn clean_stale(data: &Path, exe: Option<&Path>, failed: bool, keep: Option<&Path>) {
-    if let Ok(entries) = fs::read_dir(data.join("launcher-updates")) {
+    if let Ok(entries) = fs::read_dir(updates_dir(data)) {
         for entry in entries.flatten() {
             if entry.file_type().is_ok_and(|t| t.is_dir()) && keep != Some(entry.path().as_path()) {
                 let _ = fs::remove_dir_all(entry.path());
@@ -607,7 +612,7 @@ fn windows_executable(header: &[u8]) -> bool {
 async fn download(release: Release, data: PathBuf) -> Result<Stage, String> {
     // Recheck the signed fields before touching the staging directory.
     let release = verify(&release.envelope, &trusted_key()?)?;
-    let directory = data.join("launcher-updates").join(format!(
+    let directory = updates_dir(&data).join(format!(
         "{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -924,7 +929,7 @@ pub(crate) mod tests {
             size: archive.len() as u64, sha256: sha256_hex(archive) };
         let payload = serde_json::to_string(&payload).unwrap();
         let envelope = Envelope { signature: hex(key.sign(payload.as_bytes()).as_ref()), payload };
-        let directory = data.join("launcher-updates").join(name);
+        let directory = updates_dir(data).join(name);
         fs::create_dir_all(directory.join("verified")).unwrap();
         fs::write(directory.join("release.zip"), archive).unwrap();
         fs::write(directory.join("launcher-update.json"), serde_json::to_vec(&envelope).unwrap()).unwrap();
@@ -940,10 +945,10 @@ pub(crate) mod tests {
         assert_eq!(stage.version(), "1.2.2");
         assert_eq!(stage.directory, directory);
         // The start that reuses it keeps it; every other staging folder goes.
-        fs::create_dir_all(root.join("launcher-updates/200-2")).unwrap();
+        fs::create_dir_all(updates_dir(&root).join("200-2")).unwrap();
         clean_stale(&root, None, false, Some(&stage.directory));
         assert!(directory.join("release.zip").exists());
-        assert!(!root.join("launcher-updates/200-2").exists());
+        assert!(!updates_dir(&root).join("200-2").exists());
         // The newest of two verified downloads wins.
         staged_download(&root, "300-3", "1.3.0", &[4; 500]);
         assert_eq!(staged(&root, &key, &current).unwrap().version(), "1.3.0");
@@ -1077,7 +1082,7 @@ pub(crate) mod tests {
     fn a_failed_update_is_reported_once_and_staging_is_cleaned() {
         let root = scratch("stale");
         let data = root.join("data");
-        let updates = data.join("launcher-updates");
+        let updates = updates_dir(&data);
         fs::create_dir_all(updates.join("123-456/verified")).unwrap();
         fs::write(updates.join("last-registration-warning.txt"), "warning").unwrap();
         fs::write(updates.join("last-error.txt"), "helper failed").unwrap();
@@ -1134,7 +1139,7 @@ pub(crate) mod tests {
         let mut state = State::Error("old".into());
         let _ = update(&mut state, Msg::Check, &config, false);
         assert!(matches!(state, State::Checking));
-        fs::create_dir_all(root.join("launcher-updates")).unwrap();
+        fs::create_dir_all(updates_dir(&root)).unwrap();
         fs::write(last_error_path(&root), "old").unwrap();
         let _ = update(&mut state, Msg::Checked(Ok(None)), &config, false);
         assert!(matches!(state, State::NotPublished));

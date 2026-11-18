@@ -71,6 +71,8 @@ pub(crate) struct ImportDraft {
     pub character_slot: Option<u8>,
     /// Forest's authenticator key, in Crystal's stored form (`totp::normalize`), or empty.
     pub totp_key: String,
+    /// Forest drafts: whether the authenticator key came over (also the first note).
+    pub key_status: Option<String>,
     pub notes: Vec<String>,
 }
 
@@ -125,6 +127,17 @@ pub(crate) fn detect_sources() -> Vec<ImportSource> {
         }
     }
     sources
+}
+
+/// The source to select first: a Forest `creds.dat` (the Forest folder over POLAutoLogin's,
+/// then the newest file) when one was found, else the first source.
+pub(crate) fn default_source(sources: &[ImportSource]) -> Option<&ImportSource> {
+    let rank = |source: &ImportSource| {
+        let in_forest = source.path.parent().and_then(Path::file_name).is_some_and(|name| name.eq_ignore_ascii_case("Forest"));
+        let modified = std::fs::metadata(&source.path).and_then(|m| m.modified()).ok();
+        (in_forest, modified)
+    };
+    sources.iter().filter(|s| s.kind == SourceKind::Forest).max_by_key(|s| rank(s)).or_else(|| sources.first())
 }
 
 fn add_source(
@@ -353,14 +366,19 @@ fn import_forest(
             }
         }
         // Forest keeps the authenticator key DPAPI-protected like the password.
-        if let Some(secret) = record.enc_totp_secret.as_deref().filter(|s| !s.is_empty()) {
-            let key = decode_password(secret, &decrypt).ok().map(Zeroizing::new)
-                .and_then(|text| crate::totp::normalize(&text).ok());
-            match key {
-                Some(key) => draft.totp_key.push_str(&key),
-                None => draft.notes.push(t("Forest's authenticator key could not be imported. Enter it in the account editor.").into()),
+        let key_line = match record.enc_totp_secret.as_deref().filter(|s| !s.is_empty()) {
+            None => t("No authenticator key in Forest"),
+            Some(secret) => {
+                let key = decode_password(secret, &decrypt).ok().map(Zeroizing::new)
+                    .and_then(|text| crate::totp::normalize(&text).ok());
+                match key {
+                    Some(key) => { draft.totp_key.push_str(&key); t("Authenticator key imported") }
+                    None => t("Forest's authenticator key could not be imported. Enter it in the account editor."),
+                }
             }
-        }
+        };
+        draft.key_status = Some(key_line.into());
+        draft.notes.push(key_line.into());
         match decode_password(&record.enc_password, &decrypt) {
             Ok(password) => draft.se_password = password,
             Err(()) => draft.notes.push(t("The Square Enix password could not be imported. Enter it manually, or import while signed in to the Windows account that saved it.").into()),
@@ -451,10 +469,69 @@ mod tests {
         assert_eq!(batch.drafts[0].totp_key, "JBSWY3DPEHPK3PXP");
         assert_eq!(batch.drafts[0].se_password, "synthetic-password");
         assert!(!format!("{batch:?} {:?}", batch.drafts[0]).contains("JBSW"));
-        assert!(!batch.drafts[0].notes.iter().any(|note| note.contains("authenticator")));
+        assert_eq!(batch.drafts[0].key_status.as_deref(), Some("Authenticator key imported"));
+        assert!(batch.drafts[0].notes.iter().any(|note| note == "Authenticator key imported"));
         let bad = import(b"not base32!");
         assert!(bad.drafts[0].totp_key.is_empty());
         assert!(bad.drafts[0].notes.iter().any(|note| note.contains("authenticator key could not be imported")));
+        assert!(bad.drafts[0].key_status.as_deref().is_some_and(|s| s.contains("could not be imported")));
+    }
+
+    /// What Forest's `CredentialStore.Protect` stores: the UTF-8 text through CryptProtectData
+    /// (description "Forest", no entropy, current user), as base64 in a JSON string the way
+    /// System.Text.Json's default encoder writes it (`+` as `\u002B`).
+    fn forest_protect(plain: &str) -> String {
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::Cryptography::{CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB},
+        };
+        let description: Vec<u16> = "Forest\0".encode_utf16().collect();
+        let input = CRYPT_INTEGER_BLOB { cbData: plain.len() as u32, pbData: plain.as_ptr() as _ };
+        let mut output = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
+        // SAFETY: `input` borrows `plain` for the call; `output` is freed below.
+        let ok = unsafe {
+            CryptProtectData(&input, description.as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+        };
+        assert_ne!(ok, 0);
+        let blob = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
+        unsafe { LocalFree(output.pbData as _); }
+        crate::b64::encode(&blob).replace('+', "\\u002B")
+    }
+
+    /// A `creds.dat` as Forest 1.2.14 writes it (decompiled `CredentialStore`: a profile map,
+    /// PascalCase fields, indented with CRLF, absent values as null), read from disk through
+    /// the real DPAPI path: the authenticator key arrives with the password, and a profile
+    /// without a key says nothing about one.
+    #[test]
+    fn a_creds_file_as_forest_writes_it_brings_the_authenticator_key() {
+        let entry = |password: &str, key: Option<&str>, slot: u8| format!(
+            "{{\r\n    \"EncPassword\": \"{}\",\r\n    \"EncTotpSecret\": {},\r\n    \"WindowerProfile\": \"Box\",\r\n    \"PolSlot\": {slot},\r\n    \"LaunchArgs\": \"\",\r\n    \"Launcher\": \"Windower\",\r\n    \"IngameSlot\": 1,\r\n    \"LauncherExe\": \"C:\\\\Windower\\\\Windower.exe\",\r\n    \"AshitaBootIni\": \"\"\r\n  }}",
+            forest_protect(password),
+            key.map_or("null".to_owned(), |key| format!("\"{}\"", forest_protect(key))),
+        );
+        // Forest's account editor removes whitespace from the typed key and keeps its case.
+        let file = format!(
+            "{{\r\n  \"Tank\": {},\r\n  \"Healer\": {},\r\n  \"\\u30B7\\u30F3\": {}\r\n}}",
+            entry("synthetic-one", Some("gezdgnbvgy3tqojqgezdgnbvgy3tqojq"), 1),
+            entry("synthetic-two", None, 2),
+            entry("synthetic-three", Some("JBSWY3DPEHPK3PXP===="), 3),
+        );
+        let folder = std::env::temp_dir().join(format!("crystal-forest-{}", crate::backend::unique_id().unwrap()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("creds.dat");
+        std::fs::write(&path, file).unwrap();
+        let batch = import_file(&path, 0).unwrap();
+        let _ = std::fs::remove_dir_all(&folder);
+        let [tank, healer, shin] = &batch.drafts[..] else { panic!("three profiles") };
+        assert_eq!((tank.label.as_str(), tank.se_password.as_str(), tank.pol_slot), ("Tank", "synthetic-one", Some(1)));
+        assert_eq!(tank.totp_key, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+        assert_eq!(tank.key_status.as_deref(), Some("Authenticator key imported"));
+        assert_eq!((healer.se_password.as_str(), healer.totp_key.as_str()), ("synthetic-two", ""));
+        assert_eq!(healer.key_status.as_deref(), Some("No authenticator key in Forest"));
+        assert!(healer.notes.iter().any(|note| note == "No authenticator key in Forest"));
+        assert_eq!((shin.label.as_str(), shin.totp_key.as_str()), ("シン", "JBSWY3DPEHPK3PXP"));
+        assert_eq!(shin.launch_with, Some(LaunchWith::Windower));
     }
 
     #[test]

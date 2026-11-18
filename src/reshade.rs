@@ -54,7 +54,7 @@ fn message(msg: Msg) -> Message {
 }
 
 pub(crate) fn folder(root: &Path) -> PathBuf {
-    root.join("crystal").join("reshade")
+    crate::storage::reshade_dir(root)
 }
 
 fn root() -> PathBuf {
@@ -104,7 +104,7 @@ fn directory(path: &Path) -> Result<(), String> {
 }
 
 fn cache(root: &Path) -> Result<PathBuf, String> {
-    directory(&root.join("crystal"))?;
+    directory(root)?;
     let dir = folder(root);
     directory(&dir)?;
     Ok(dir)
@@ -218,7 +218,7 @@ fn place_once(path: &Path, bytes: &[u8]) -> Result<(), String> {
 
 fn variant(root: &Path, host: &[u8], dll: &[u8]) -> Result<PathBuf, String> {
     let dir = cache(root)?;
-    let hosts = dir.join("hosts");
+    let hosts = crate::storage::reshade_hosts(&dir);
     directory(&hosts)?;
     // The runtime was verified against DLL_HASH, so its name part is known.
     let launch = hosts.join(format!("{}-{}", &digest(host)[..16], &DLL_HASH[..16]));

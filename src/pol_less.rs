@@ -18,9 +18,9 @@ pub(crate) mod tools;
 mod turns;
 mod windower_parallel;
 
-use crate::backend::{plain_windows_path, unique_id, with_log, Account, Config, LaunchResult};
+use crate::backend::{plain_windows_path, with_log, Account, Config, LaunchResult};
 use crate::i18n::{t, tf};
-use crate::launch_log::{classify_loader_end, LoaderEnd, Session};
+use crate::launch_log::{classify_host_end, LoaderEnd, Session};
 use crate::launch_timing::{noted, Milestone, Timeline};
 use pipe::{AcceptError, LoaderEvent, LoaderPipe};
 use std::{
@@ -106,10 +106,18 @@ pub(crate) struct Plan {
     /// Recovery relaunches by itself: the loader presses OK on the in-world disconnect dialog.
     #[serde(default)]
     pub dismiss_disconnect: bool,
+    /// The controller buttons the game hides for Crystal's pad hotkeys (`[modifiers, trigger]`
+    /// in XInput bits); empty: none, and the lines carry no `pad_hide`.
+    #[serde(default)]
+    pub pad_hide: Vec<[u32; 2]>,
     /// What started this launch, for the launch log's trigger line (pol-spec 07d §4.2).
     /// Older window processes send none: `Play`.
     #[serde(default)]
     pub trigger: crate::launch_timing::LaunchTrigger,
+    /// The account's row on Home when this launch started (1-based; 0: unknown). Game logs
+    /// are named and headed by it, never by the account's name (owner decision 2026-11-17).
+    #[serde(default)]
+    pub account_number: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -188,8 +196,13 @@ pub(crate) trait SignedIn: Send + Sync + 'static {
     fn native_own_portrait(&self, _portrait: u16) -> Result<(), String> { Ok(()) }
     fn native_control_result(&self, _action: &str, _code: i32) -> Result<(), String> { Ok(()) }
     fn take_controller_settings(&self) -> Option<Vec<u8>> { None }
+    /// The controller buttons the game hides for Crystal's pad hotkeys, changed while it runs.
+    fn take_pad_hide(&self) -> Option<Vec<u8>> { None }
     fn take_game_shutdown(&self) -> Option<Vec<u8>> { None }
-    fn game_shutdown_result(&self, _id: u64, _game: u64, _ok: bool, _message: &str) -> Result<(), String> { Ok(()) }
+    fn game_shutdown_result(&self, _id: u64, _game: u64, _ok: bool, _message: &str,
+        _answer: Option<crate::session_worker::game_shutdown::Answer>) -> Result<(), String> { Ok(()) }
+    /// The game in the world lost its connection: its fatal dialog is up.
+    fn game_disconnected(&self) -> Result<(), String> { Ok(()) }
     fn native_game_ended(&self, _game: u64, _returned: bool) -> Result<(), String> { Ok(()) }
     /// The window's "Close games instantly" ended this session's host (consumed once).
     fn game_terminated(&self) -> bool { false }
@@ -288,6 +301,7 @@ fn configure(auth: &mut native_auth::NativeAuth, plan: &Plan) {
     auth.set_viewer_gaps(plan.social_only && plan.viewer_gaps);
     auth.set_keep_session(plan.keep_session);
     auth.set_dismiss_disconnect(plan.dismiss_disconnect);
+    auth.set_pad_hide(plan.pad_hide.clone());
     auth.set_auto_away(plan.auto_away_minutes);
     auth.set_auto_login(plan.auto_login);
 }
@@ -338,6 +352,8 @@ struct Prepared {
     private_bootstrap: Option<windower_parallel::Snapshot>,
     /// What started this launch, for the log's trigger line (07d §4.2).
     trigger: crate::launch_timing::LaunchTrigger,
+    /// The game log's header (`game_log::Header`), written when the log is new.
+    header: Vec<String>,
 }
 
 /// The stock FFXI check for a game folder: `Ok(note)` to start, `Err(message)` to stop,
@@ -545,8 +561,21 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
     let overrides = crate::features::runtime::launch_values(config, &crate::backend::account_key(account), slot);
     let ffxi_settings = ffxi_settings.map(|settings| ffxi_settings::with_overrides(settings, &overrides));
     timing.stage("preparation: launch settings read");
-    let logs = config.logs_directory(account);
+    let logs = config.game_logs_directory();
     fs::create_dir_all(&logs).map_err(|_| t("Could not create the account's log folder."))?;
+    let header = crate::game_log::Header {
+        host: Some(loader.clone()),
+        tool: tool.name(),
+        tool_version: match tool {
+            Tool::Windower => crate::game_log::file_version(&tool_dir.join("Hook.dll")),
+            Tool::Ashita => crate::game_log::file_version(&tool_dir.join(tool.exe())),
+            Tool::Vanilla => None,
+        },
+        dgvoodoo: settings.dgvoodoo,
+        reshade: settings.reshade.enabled,
+        region: account.region,
+        number: plan.account_number,
+    }.lines();
     timing.stage("preparation: log directory ready");
     Ok(Prepared {
         tool,
@@ -562,8 +591,9 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
         session: Session {
             history: config.history_path(),
             label: account.label.clone(),
-            log: logs.join(format!("{}.crystal.log", unique_id()?)),
+            log: crate::game_log::path_in(&logs, &chrono::Local::now().naive_local(), plan.account_number),
         },
+        header,
         friends_directory: Some(config.account_directory(account)),
         // The same W20/0001 frame; a Japanese install's Viewer names the host pc001W20.
         check: if target.experimental().is_some_and(|values| values.region == crate::retail_region::RetailRegion::Jp) {
@@ -579,7 +609,7 @@ fn prepare_with_progress(config: &Config, plan: &Plan, account: &Account, timing
 
 /// Saved Windower startup snapshots, in Crystal's per-user data folder next to `crystal\pol.exe`.
 fn windower_startup_store(config: &Config) -> PathBuf {
-    config.experiment.join("iced-launcher").join("crystal").join("windower-startup")
+    config.layout().windower_startup()
 }
 
 /// The retail game folder the loader runs: the one chosen on Downloads, else the installed
@@ -633,6 +663,8 @@ pub(crate) struct SessionLog {
     native_connection_lost: bool,
     /// This game reported losing its connection in the world (`game_disconnected`).
     game_disconnected: bool,
+    /// That report's network state and POL result, for the end's reason (`host_exit`).
+    disconnect: Option<(u32, i32)>,
 }
 impl SessionLog {
     fn open(path: &Path) -> Result<Self, String> {
@@ -649,6 +681,14 @@ impl SessionLog {
             let flat: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
             // One append per line: the Windower watcher writes to the same log from its thread.
             let _ = file.write_all(format!("[{time}] [launcher] {flat}\n").as_bytes());
+        }
+    }
+    /// One of the host's key lines, marked as the host's: `[time] [host] <line>`.
+    fn loader_line(&mut self, text: &str) {
+        if let Some(file) = &mut self.file {
+            let time = chrono::Local::now().format("%H:%M:%S");
+            let flat: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+            let _ = file.write_all(format!("[{time}] [host] {flat}\n").as_bytes());
         }
     }
     /// Write any timing marks the log has not seen yet.
@@ -965,6 +1005,7 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
             log.native_failure = false;
             log.native_connection_lost = false;
             log.game_disconnected = false;
+            log.disconnect = None;
             log.line(&format!("Game started (GameStart called){}", pid.map_or(String::new(), |p| format!(", PID {p}"))));
             Step::Started
         }
@@ -1014,8 +1055,8 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
             if let Err(error) = auth.native_own_portrait(portrait) { log.line(&error); }
             Step::Continue
         }
-        LoaderEvent::GameShutdownResult { id, game, ok, message } => {
-            if let Err(error) = auth.game_shutdown_result(id, game, ok, &message) { log.line(&error); }
+        LoaderEvent::GameShutdownResult { id, game, ok, message, answer } => {
+            if let Err(error) = auth.game_shutdown_result(id, game, ok, &message, answer) { log.line(&error); }
             Step::Continue
         }
         LoaderEvent::ControllerResult { id, ok, message } => {
@@ -1047,7 +1088,9 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
         }
         LoaderEvent::GameDisconnected { state, code } => {
             log.game_disconnected = true;
+            log.disconnect = Some((state, code));
             log.line(&format!("FFXI lost its connection in the world (network state {state:#x}, POL result {code}); it ends after its dialog."));
+            if let Err(error) = auth.game_disconnected() { log.line(&error); }
             Step::Continue
         }
         LoaderEvent::NativeSignOutComplete(code) => {
@@ -1077,6 +1120,10 @@ fn handle_event(event: LoaderEvent, auth: &impl SignedIn, log: &mut SessionLog) 
         // does not know, or whether dgVoodoo loaded): said in the history, and the game goes on.
         LoaderEvent::Notice(message) => {
             log.line(&crate::dgvoodoo::loader_notice(&message).unwrap_or(message));
+            Step::Continue
+        }
+        LoaderEvent::Log(line) => {
+            log.loader_line(&line);
             Step::Continue
         }
         LoaderEvent::Closed => {
@@ -1210,6 +1257,10 @@ fn watch(pipe: &mut LoaderPipe, auth: &impl SignedIn, log: &mut SessionLog, game
         }
         if let Some(line) = auth.take_controller_settings() {
             if pipe.send(&line, Instant::now() + Duration::from_secs(2)).is_err() { return LoaderEnd::Closed; }
+        }
+        if let Some(line) = auth.take_pad_hide() {
+            if pipe.send(&line, Instant::now() + Duration::from_secs(2)).is_err() { return LoaderEnd::Closed; }
+            log.line("Controller hotkey buttons sent to the game.");
         }
         if Instant::now() >= next_publication {
             if matches!(auth.retry_native_publication(), Ok(true)) {
@@ -1375,6 +1426,12 @@ fn deliver_handoff(
 /// The launch log's opening lines: `first` (the park's `park start` line), else the launch
 /// clock and the trigger (07d §4.2), then the launcher image and route.
 fn open_launch_log(p: &Prepared, timing: &mut Timeline, first: Option<&str>) -> Result<SessionLog, String> {
+    // A new log starts with its header; a parked host's Play continues the same log.
+    if fs::metadata(&p.session.log).map_or(true, |meta| meta.len() == 0) && !p.header.is_empty() {
+        let mut text = p.header.join("\r\n");
+        text.push_str("\r\n\r\n");
+        let _ = fs::write(&p.session.log, text);
+    }
     let mut log = SessionLog::open(&p.session.log)?;
     match first {
         Some(line) => log.line(line),
@@ -1429,11 +1486,14 @@ fn supervise<A: SignedIn>(p: &Prepared, auth: A) -> Result<Supervision<A>, Strin
         .spawn(move || {
             if let Ok((mut pipe, auth, mut log, started, launch_timing, mut game_check)) = receiver.recv() {
                 let end = watch(&mut pipe, auth.as_ref(), &mut log, &mut game_check);
+                let host = pipe.take_host();
                 drop(pipe);
                 let end = user_terminated(end, auth.as_ref());
-                let report = classify_loader_end(&end, started.elapsed());
-                log.line(&format!("Session over: {}. Closing the sign-in session.", report.summary));
-                session.record(&noted(&report.summary, &launch_timing));
+                let host_end = host_end(&log, host.as_ref(), crate::host_exit::EXIT_WAIT);
+                let report = classify_host_end(&end, started.elapsed(), host_end.evidence());
+                let reason = host_end.reason();
+                log.line(&format!("Session over: {}; game host {reason}. Closing the sign-in session.", report.summary));
+                session.record(&noted(&format!("{} · {reason}", report.summary), &launch_timing));
                 if let Ok(mut slot) = tracked_outcome.lock() {
                     *slot = Some(report);
                 }
@@ -1443,6 +1503,12 @@ fn supervise<A: SignedIn>(p: &Prepared, auth: A) -> Result<Supervision<A>, Strin
         })
         .map_err(|_| t("Could not start the retail session supervisor."))?;
     Ok(Supervision { auth, game_running, log_path: p.session.log.clone(), sender, alive, outcome, game_check: GameVersionCheck::new(p), tool: p.tool })
+}
+
+/// How the host ended: its reason for the log and history, and its evidence for the end's kind.
+fn host_end(log: &SessionLog, host: Option<&crate::host_exit::Host>, wait: Duration) -> crate::host_exit::End {
+    let disconnected = log.disconnect.filter(|_| log.game_disconnected);
+    crate::host_exit::observe(host, disconnected, wait)
 }
 
 /// A host the user's "Close games instantly" ended is a normal close, whatever its pipe saw.
@@ -1797,6 +1863,10 @@ fn fail(log: &mut SessionLog, log_path: &Path, message: String) -> String {
     with_log(message, log_path)
 }
 
+/// How long a launch that failed before the game started waits for its host's exit status:
+/// short, as the account's row waits for this answer.
+const START_EXIT_WAIT: Duration = Duration::from_secs(1);
+
 /// The session line (or a parked host's credentials) went out: wait for the sign-in and
 /// the game start, then hand the session to its supervisor.
 fn finish<A: SignedIn>(supervision: Supervision<A>, mut log: SessionLog, mut pipe: LoaderPipe, pid: u32, mut timing: Timeline,
@@ -1809,8 +1879,12 @@ fn finish<A: SignedIn>(supervision: Supervision<A>, mut log: SessionLog, mut pip
     progress(if deferred { t("Signing in to PlayOnline...") } else { t("Waiting for the game to start...") });
     // The loader went on after an unanswered W2U and then failed: say why the W2U failed
     // too (07d §5.6 step 4).
-    let ended = |log: &mut SessionLog, end: LoaderEnd, cause: Option<&str>| {
-        let report = classify_loader_end(&end, started.elapsed());
+    let ended = |log: &mut SessionLog, end: LoaderEnd, cause: Option<&str>, host: Option<crate::host_exit::Host>| {
+        let host_end = host_end(log, host.as_ref(), START_EXIT_WAIT);
+        let report = classify_host_end(&end, started.elapsed(), host_end.evidence());
+        // The game log says why the host ended.
+        let reason = host_end.reason();
+        log.line(&format!("Game host {reason}."));
         let mut message = tf("{summary} ({tool} via crystal-loader).", &[("summary", &report.message()), ("tool", &tool.name())]);
         if let Some(cause) = cause {
             message.push(' ');
@@ -1820,7 +1894,7 @@ fn finish<A: SignedIn>(supervision: Supervision<A>, mut log: SessionLog, mut pip
     };
     let mut confirmed = match wait_started(&mut pipe, auth.as_ref(), &mut log, limits.start, &mut timing, progress, false, &mut game_check) {
         Ok(confirmed) => confirmed,
-        Err(end) => return Err(ended(&mut log, end, game_check.viewer_cause.as_deref())),
+        Err(end) => return Err(ended(&mut log, end, game_check.viewer_cause.as_deref(), pipe.take_host())),
     };
     // Full native idle is required even if the version check, started at the main menu,
     // finished earlier.
@@ -1830,7 +1904,7 @@ fn finish<A: SignedIn>(supervision: Supervision<A>, mut log: SessionLog, mut pip
             Ok(Ok(())) => {
                 confirmed = match wait_started(&mut pipe, auth.as_ref(), &mut log, limits.start, &mut timing, progress, true, &mut game_check) {
                     Ok(confirmed) => confirmed,
-                    Err(end) => return Err(ended(&mut log, end, None)),
+                    Err(end) => return Err(ended(&mut log, end, None, pipe.take_host())),
                 };
             }
             Ok(Err(message)) => blocked = Some(message),
@@ -1859,7 +1933,7 @@ fn finish<A: SignedIn>(supervision: Supervision<A>, mut log: SessionLog, mut pip
     if sender.send((pipe, auth, log, started, summary, game_check)).is_err() {
         return Err(t("The retail session supervisor could not accept the game session.").into());
     }
-    Ok(LaunchResult { pid, detail, alive, game_running, log: log_path, outcome, timing: row_timing })
+    Ok(LaunchResult { connection_lost: Default::default(), pid, detail, alive, game_running, log: log_path, outcome, timing: row_timing })
 }
 
 /// The Settings page's view of the tools: what was found where.
@@ -1887,6 +1961,7 @@ pub(crate) fn detect_all(settings: &ToolSettings) -> Detected {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::unique_id;
 
     /// The launcher scans controllers unless the launch's own settings turn the gamepad off,
     /// exactly when the host would skip the game's controller query.
@@ -2099,6 +2174,7 @@ mod tests {
             bootstrap_key: Err("fixture"),
             private_bootstrap: None,
             trigger: crate::launch_timing::LaunchTrigger::Play,
+            header: Vec::new(),
         };
         (prepared, dir)
     }
@@ -2611,7 +2687,8 @@ mod tests {
         let report = result.outcome.lock().unwrap().clone().unwrap();
         assert_eq!(report.summary, "Game exited during startup with code 0");
         let history = fs::read_to_string(dir.join("history.log")).unwrap();
-        assert!(history.contains("| Fake | Game exited during startup with code 0 (launch: tool "), "{history}");
+        // The host's end follows the classification; this stand-in host has no process of its own.
+        assert!(history.contains("| Fake | Game exited during startup with code 0 · ended (exit status unknown) (launch: tool "), "{history}");
         assert!(history.contains(", hello ") && history.contains(", game started "), "{history}");
         assert!(result.timing.starts_with("Game started "), "{}", result.timing);
         let log = fs::read_to_string(dir.join("a.crystal.log")).unwrap();
@@ -2723,7 +2800,7 @@ mod tests {
         };
         let plan = Plan {
             social_only: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0,
             tool: Tool::Ashita,
             settings: ToolSettings { ashita: dir.join("none").to_string_lossy().into_owned(), ..Default::default() },
         };
@@ -2733,7 +2810,7 @@ mod tests {
         fs::write(dir.join("Ashita-cli.exe"), b"").unwrap();
         let plan = Plan {
             social_only: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0,
             tool: Tool::Ashita,
             settings: ToolSettings {
                 ashita: dir.to_string_lossy().into_owned(),
@@ -2747,7 +2824,7 @@ mod tests {
         fs::write(dir.join("crystal-loader.exe"), b"").unwrap();
         let plan = Plan {
             social_only: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0,
             tool: Tool::Ashita,
             settings: ToolSettings {
                 ashita: dir.to_string_lossy().into_owned(),
@@ -2776,7 +2853,7 @@ mod tests {
             server: String::new(), pol_id: "ABCD1234".into(), pol_password: "synthetic".into(),
             se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
             launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() };
-        let plan = Plan { tool: Tool::Vanilla, social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
+        let plan = Plan { tool: Tool::Vanilla, social_only: false, auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0,
             settings: ToolSettings { loader: loader.to_string_lossy().into_owned(),
                 ashita: root.join("missing-ashita").to_string_lossy().into_owned(),
                 windower: root.join("missing-windower").to_string_lossy().into_owned(),
@@ -2805,7 +2882,7 @@ mod tests {
         assert_eq!(prepared.ffxi_settings.unwrap().json, "{}");
         assert_eq!(prepared.base_ini.as_deref(), Some(boot.as_slice()));
         assert_eq!(fs::read(ashita.join("config/boot/fixture.ini")).unwrap(), boot);
-        let menu = root.join("iced-launcher/menu-playonlineus.json");
+        let menu = crate::storage::Layout::at(&root).menu("PlayOnlineUS");
         fs::create_dir_all(menu.parent().unwrap()).unwrap();
         fs::write(&menu, "[1600,900]").unwrap();
         let prepared = prepare(&config, &plan, &account).unwrap();
@@ -2832,7 +2909,7 @@ mod tests {
         let plugin_file = windower.join("plugins/settings/ffxidb.xml");
         let plugin = br#"<settings><global><Map><X>700</X><Y>300</Y><Scale>1.2</Scale></Map></global></settings>"#;
         fs::write(&plugin_file, plugin).unwrap();
-        let menu_file = root.join("iced-launcher/menu-playonlineus.json");
+        let menu_file = crate::storage::Layout::at(&root).menu("PlayOnlineUS");
         fs::create_dir_all(menu_file.parent().unwrap()).unwrap();
         let config = Config { experiment: root.clone(), repository: root.clone(),
             game_install: Some(game), dat_overlays: Vec::new() };
@@ -2841,7 +2918,7 @@ mod tests {
             se_id: "synthetic".into(), se_password: "synthetic".into(), region: 0,
             launch_with: None, ashita_boot_ini: None, windower_profile: None, pol_handle_names: String::new(), totp_key: String::new() };
         let mut plan = Plan { tool: Tool::Windower, social_only: false,
-            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger: Default::default(),
+            auto_away_minutes: 10, auto_login: crate::pol_less::AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger: Default::default(), account_number: 0,
             settings: ToolSettings { loader: loader.to_string_lossy().into_owned(),
                 windower: windower.to_string_lossy().into_owned(), ..Default::default() } };
         for retained_menu in ["[640,480]", "not valid JSON"] {
@@ -3665,7 +3742,7 @@ mod tests {
 
     fn parked_plan(trigger: crate::launch_timing::LaunchTrigger) -> Plan {
         Plan { tool: Tool::Windower, settings: Default::default(), social_only: false, auto_away_minutes: 10,
-            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, trigger }
+            auto_login: AutoLogin::default(), keep_session: false, viewer_gaps: false, dismiss_disconnect: false, pad_hide: Vec::new(), trigger, account_number: 0 }
     }
 
     /// 07d §1.4, §5.2: the parked host gets only the `park` line until Play; at Play the

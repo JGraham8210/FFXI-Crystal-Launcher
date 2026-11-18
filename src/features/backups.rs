@@ -2,7 +2,7 @@
 //! (macros, keybinds, per-character UI files), Windower 4's settings, scripts, add-on data and
 //! plugin settings, and Ashita v4's config and scripts.
 //!
-//! Archives are dated zips in `iced-launcher/backups/` beside Crystal's other files. Each holds
+//! Archives are dated zips in `Backups\archives\` beside Crystal's other files. Each holds
 //! the files under `ffxi/<index>/USER/...`, `windower/...` and `ashita/...` plus a
 //! `manifest.json` with every file's size and SHA-256, so a damaged archive is found before it
 //! is trusted. Nothing here touches the network, and nothing here ever writes game executables
@@ -148,7 +148,7 @@ struct FileEntry { path: String, size: u64, sha256: String }
 struct Item { name: String, path: PathBuf, size: u64 }
 
 pub(crate) fn backups_dir(config: &Config) -> PathBuf {
-    config.experiment.join("iced-launcher").join("backups")
+    config.layout().archives()
 }
 
 fn unreadable() -> String { t("The backup could not be read.").into() }

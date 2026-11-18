@@ -7,11 +7,12 @@
 //! This module logs that path once per change, tells the launcher the game is
 //! ending on a lost connection, and, only when the launcher's Recovery
 //! relaunches by itself, presses OK once: after the dialog has stayed focused
-//! for a moment, never after the user's own input, never on another menu.
+//! for a moment, never after the user's own input, never on another menu. Crystal's Shut down
+//! presses the same OK at once (`DialogOk`, from game_shutdown), with the same checks.
 
 use std::{sync::{mpsc, Mutex}, thread, time::{Duration, Instant}};
 use windows_sys::Win32::{System::Threading::GetCurrentThreadId, UI::WindowsAndMessaging::GetForegroundWindow};
-use crate::{auto_login::{self, Key, Layout, Tap}, game_layout::{Input, Resolution}, lobby, log, mem::read};
+use crate::{auto_login::{self, Key, Layout, Tap}, game_layout::{Input, Resolution}, key_log, lobby, log, mem::read};
 
 const POLL: Duration = Duration::from_millis(200);
 /// The dialog must stay focused and unchanged this long before OK.
@@ -123,23 +124,53 @@ fn command() -> std::sync::MutexGuard<'static, Option<Command>> {
 pub(crate) fn on_input(data: *mut u8) {
     let Ok(mut pending) = COMMAND.try_lock() else { return };
     let Some(input) = pending.as_ref() else { return };
-    let base = input.sources.layout.base;
     if unsafe { GetCurrentThreadId() } != input.game_thread
-        || auto_login::frame_keyboard(base, input.keys.keyboard, data).is_none() {
+        || auto_login::frame_keyboard(input.sources.layout.base, input.keys.keyboard, data).is_none() {
         return;
     }
-    let window = input.window as windows_sys::Win32::Foundation::HWND;
-    let view = input.sources.view();
     let outcome = if input.expires < Instant::now() || crate::events::pipe_closed() {
         Tap::Cancelled
-    } else if auto_login::game_window(&input.sources.layout) != Some((window, input.game_thread))
-        || !auto_login::usable(window, input.game_thread)
-        || !view.stopped() || view.dialog != Some(input.focus)
-        || (unsafe { GetForegroundWindow() } == window && auto_login::keys_down())
-        || read::<[u8; 256]>(base + input.keys.input).is_none_or(|keys| keys.iter().any(|key| key & 7 != 0)) {
-        Tap::Skipped
-    } else if auto_login::send(base, &input.keys, Key::Enter) { Tap::Sent } else { Tap::Failed };
+    } else {
+        tap(&input.sources, &input.keys, input.window, input.game_thread, input.focus)
+    };
     if let Some(input) = pending.take() { let _ = input.result.send(outcome); }
+}
+
+/// On the game thread's keyboard frame: Enter on `focus`, only while it is still the focused
+/// fatal-stop dialog of this game's usable window and no key or button is held.
+fn tap(sources: &Sources, keys: &Input, window: usize, game_thread: u32, focus: usize) -> Tap {
+    let base = sources.layout.base;
+    let window = window as windows_sys::Win32::Foundation::HWND;
+    let view = sources.view();
+    if auto_login::game_window(&sources.layout) != Some((window, game_thread))
+        || !auto_login::usable(window, game_thread)
+        || !view.stopped() || view.dialog != Some(focus)
+        || (unsafe { GetForegroundWindow() } == window && auto_login::keys_down())
+        || read::<[u8; 256]>(base + keys.input).is_none_or(|keys| keys.iter().any(|key| key & 7 != 0)) {
+        Tap::Skipped
+    } else if auto_login::send(base, keys, Key::Enter) { Tap::Sent } else { Tap::Failed }
+}
+
+/// The fatal-stop dialog's OK for Crystal's Shut down: no settle time, no world or Recovery
+/// gate, the same identity and input checks as the automatic OK.
+#[derive(Clone, Copy)]
+pub(crate) struct DialogOk { sources: Sources, keys: Input }
+
+impl DialogOk {
+    pub(crate) fn resolve(resolution: &Resolution) -> Result<Self, String> {
+        let keys = resolution.input.clone().map_err(|reason| format!("key input: {reason}"))?;
+        Ok(Self { sources: Sources::resolve(resolution)?, keys })
+    }
+
+    /// From a keyboard frame on the game thread. `None`: no fatal stop with its "ok" menu
+    /// focused (the title screen, the lobby, the world).
+    pub(crate) fn press_now(&self) -> Option<Tap> {
+        let view = self.sources.view();
+        let focus = view.dialog.filter(|_| view.stopped())?;
+        let (window, game_thread) = auto_login::game_window(&self.sources.layout)?;
+        if unsafe { GetCurrentThreadId() } != game_thread { return Some(Tap::Skipped); }
+        Some(tap(&self.sources, &self.keys, window as usize, game_thread, focus))
+    }
 }
 
 fn press(sources: Sources, keys: Input, focus: usize, stop: &mpsc::Receiver<()>) -> Tap {
@@ -227,7 +258,7 @@ fn run(dismiss: bool, stopping: &mpsc::Receiver<()>) {
         if !reported && decision.disconnected(view) {
             reported = true;
             let (state, pol) = view.network.unwrap_or_default();
-            log!("disconnect: FFXI lost its connection in the world (network state {state:#x}, POL result {pol}); its dialog follows");
+            key_log!("disconnect: FFXI lost its connection in the world (network state {state:#x}, POL result {pol}); its dialog follows");
             crate::events::send(crate::proto::game_disconnected_line(state, pol));
         }
         match act {
@@ -235,17 +266,17 @@ fn run(dismiss: bool, stopping: &mpsc::Receiver<()>) {
             Act::Press(focus) => {
                 let Some((keys, _)) = input else { continue };
                 match press(*sources, *keys, focus, stopping) {
-                    Tap::Sent => { decision.pressed(now); log!("disconnect: pressed OK on menu={}", auto_login::menu_name(&sources.layout)); }
+                    Tap::Sent => { decision.pressed(now); key_log!("disconnect: pressed OK on menu={}", auto_login::menu_name(&sources.layout)); }
                     Tap::Skipped => {}
                     Tap::Cancelled => return,
-                    Tap::Failed => { log!("disconnect: the game did not take the OK key; the dialog is left to the user"); return; }
+                    Tap::Failed => { key_log!("disconnect: the game did not take the OK key; the dialog is left to the user"); return; }
                 }
             }
             Act::Closed => { closed = Some(now); log!("disconnect: dialog closed; waiting for FFXI to end"); }
             Act::Stop(reason) => log!("disconnect: no automatic OK: {reason}"),
         }
         if closed.is_some_and(|at| now.saturating_sub(at) >= EXIT_NOTE) {
-            log!("disconnect: FFXI is still running {}s after its dialog closed", EXIT_NOTE.as_secs());
+            key_log!("disconnect: FFXI is still running {}s after its dialog closed", EXIT_NOTE.as_secs());
             closed = None;
         }
     }

@@ -32,34 +32,37 @@ impl Default for Settings {
 pub(crate) enum EndKind {
     /// The user quit the game, or asked Crystal to close it or sign out.
     UserClosed,
-    /// The game process faulted: an exception exit status, a Windows Error Reporting record, or
-    /// a host that vanished without reporting an exit.
+    /// The game process faulted: an exception exit status, a crash dump, a Windows Error
+    /// Reporting record, or a host that vanished during startup.
     Crash,
     /// The game ended itself with an error code (FFXI returns from GameStart with one when the
     /// connection is lost).
     Disconnect,
-    /// Something on Crystal's side ended the session (loader error, worker gone): offered, never
-    /// repeated automatically.
+    /// No evidence of a failure (a host killed with a plain status, a loader error, a worker
+    /// gone): offered, never repeated automatically.
     Unknown,
 }
 
-/// An exit status Windows uses for an unhandled exception (an NTSTATUS error: 0xC0000000+).
-pub(crate) fn is_exception_status(code: i32) -> bool { (code as u32) >= 0xC000_0000 }
+/// An exit status Windows uses for an unhandled exception (an NTSTATUS warning or error).
+pub(crate) fn is_exception_status(code: i32) -> bool { crate::host_exit::crashed(code as u32) }
 
 /// Classify an ended game. `user_closed`: Crystal's Shutdown or Sign out was used for it.
 /// `wer`: Windows Error Reporting recorded a crash of the host since the game started.
+/// Automatic relaunch needs positive evidence of a failure (`Crash` or `Disconnect`), so a
+/// wrong guess about an unexplained end only ever offers.
 pub(crate) fn classify(report: Option<&ExitReport>, user_closed: bool, wer: bool) -> EndKind {
     if user_closed { return EndKind::UserClosed; }
     let Some(report) = report else { return if wer { EndKind::Crash } else { EndKind::Unknown } };
     let exception = report.exit_status.is_some_and(is_exception_status)
         || matches!(report.kind, ExitKind::Code { code } if is_exception_status(code));
-    if exception || wer { return EndKind::Crash; }
+    if exception || report.crash_dump || wer { return EndKind::Crash; }
     match &report.kind {
-        ExitKind::Normal => EndKind::UserClosed,
+        ExitKind::Normal | ExitKind::Ended => EndKind::UserClosed,
         ExitKind::Code { .. } | ExitKind::Disconnected => EndKind::Disconnect,
-        // The host ended without an exit line (or with a plain failure status): it died.
-        ExitKind::Other | ExitKind::Startup => EndKind::Crash,
-        ExitKind::LoaderError { .. } | ExitKind::WorkerEnded => EndKind::Unknown,
+        // Held back as a startup failure: offered only.
+        ExitKind::Startup => EndKind::Crash,
+        // The host ended without an exit line and a plain or unread status: a kill, not a fault.
+        ExitKind::Other | ExitKind::LoaderError { .. } | ExitKind::WorkerEnded => EndKind::Unknown,
     }
 }
 
@@ -172,7 +175,34 @@ mod tests {
     use super::*;
 
     fn report(kind: ExitKind, status: Option<i32>) -> ExitReport {
-        ExitReport { kind, exit_status: status, during_startup: false, summary: String::new() }
+        ExitReport { kind, exit_status: status, during_startup: false, crash_dump: false, summary: String::new() }
+    }
+
+    /// Statuses read from Windower's, Ashita's and Task Manager's binaries (`host_exit`).
+    #[test]
+    fn only_failure_evidence_relaunches_a_closed_host() {
+        use crate::launch_log::{classify_host_end, HostExit, LoaderEnd};
+        let long = Duration::from_secs(600);
+        let kind = |status, dump, disconnected| classify(Some(&classify_host_end(&LoaderEnd::Closed, long,
+            HostExit { status, dump, disconnected })), false, false);
+        assert_eq!(kind(Some(0), false, false), EndKind::UserClosed, "//terminate, /terminate");
+        assert_eq!(kind(Some(1), false, false), EndKind::Unknown, "Task Manager");
+        assert_eq!(kind(Some(u32::MAX), false, false), EndKind::Unknown, "Process.Kill, Windower's fatal exit");
+        assert_eq!(kind(None, false, false), EndKind::Unknown, "status unread");
+        assert_eq!(kind(Some(0xC000_0005), false, false), EndKind::Crash);
+        assert_eq!(kind(Some(0x8000_0003), false, false), EndKind::Crash, "Windower's int3");
+        assert_eq!(kind(Some(0), true, false), EndKind::Crash, "a dump");
+        assert_eq!(kind(Some(0), false, true), EndKind::Disconnect);
+        let early = classify_host_end(&LoaderEnd::Closed, Duration::from_secs(5), HostExit { status: Some(0), ..HostExit::default() });
+        assert_eq!(classify(Some(&early), false, false), EndKind::Crash);
+        // Unknown and startup ends are offered, never relaunched by themselves.
+        let mut policy = Policy::default();
+        let settings = Settings { auto_relaunch: true, ..Settings::default() };
+        assert_eq!(policy.on_end("a", EndKind::Unknown, false, long, Instant::now(), false, &settings),
+            Decision::Offer { kind: EndKind::Unknown, held: Held::NotAutomatic });
+        assert_eq!(policy.on_end("a", EndKind::Crash, true, Duration::from_secs(5), Instant::now(), false, &settings),
+            Decision::Offer { kind: EndKind::Crash, held: Held::Startup });
+        assert_eq!(policy.on_end("a", EndKind::UserClosed, false, long, Instant::now(), false, &settings), Decision::None);
     }
 
     #[test]
@@ -189,7 +219,8 @@ mod tests {
         // ordinary result; the loader's game_disconnected report makes it a disconnect.
         assert_eq!(classify(Some(&report(ExitKind::Disconnected, None)), false, false), EndKind::Disconnect);
         assert_eq!(classify(Some(&report(ExitKind::Disconnected, None)), true, false), EndKind::UserClosed, "Crystal's own shutdown wins");
-        assert_eq!(classify(Some(&report(ExitKind::Other, None)), false, false), EndKind::Crash);
+        assert_eq!(classify(Some(&report(ExitKind::Other, None)), false, false), EndKind::Unknown, "no evidence of a fault");
+        assert_eq!(classify(Some(&report(ExitKind::Other, None)), false, true), EndKind::Crash, "a WER record is one");
         assert_eq!(classify(Some(&report(ExitKind::Startup, None)), false, false), EndKind::Crash);
         assert_eq!(classify(Some(&report(ExitKind::LoaderError { message: "x".into() }, None)), false, false), EndKind::Unknown);
         assert_eq!(classify(Some(&ExitReport::worker_ended()), false, false), EndKind::Unknown);

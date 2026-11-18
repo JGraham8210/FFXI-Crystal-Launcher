@@ -356,6 +356,13 @@ export component AccountSheet inherits SideSheet {
         }
         Rectangle { horizontal-stretch: 1; }
         Control { modal: true; text: View.sheet-strings.cancel; clicked => { View.close-sheet(); } }
+        if View.sheet.can-merge: Control {
+            modal: true;
+            tone: Tone.primary;
+            text: View.sheet.merge-label;
+            enabled: View.sheet.save-enabled;
+            clicked => { View.merge-sheet(); }
+        }
         Control {
             modal: true;
             tone: Tone.primary;

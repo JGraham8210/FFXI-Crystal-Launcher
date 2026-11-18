@@ -263,6 +263,13 @@ pub(crate) struct Settings {
     /// Bring this account's game window forward, by account key.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "chords")]
     pub accounts: BTreeMap<String, Hotkey>,
+    /// The controller's: the same three jobs (`padchord`). In-game only, all of them.
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::padchord::chord")]
+    pub pad_cycle: Option<super::padchord::PadChord>,
+    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "super::padchord::chord")]
+    pub pad_cycle_back: Option<super::padchord::PadChord>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", deserialize_with = "super::padchord::chords")]
+    pub pad_accounts: BTreeMap<String, super::padchord::PadChord>,
 }
 
 // A chord that does not read (a newer Crystal's, or a typo) is dropped on its own: the others,
@@ -315,6 +322,9 @@ pub(crate) enum Problem {
     ShiftNumpad,
     /// Another of Crystal's hotkeys has the same chord.
     Duplicate,
+    /// A controller chord whose held buttons are another controller hotkey's every button:
+    /// that one fires first.
+    Overlap,
     /// Another program registered it first.
     InUse,
     /// RegisterHotKey failed for another reason.
@@ -332,6 +342,7 @@ impl Problem {
             Self::Reserved => t("Windows reserves this hotkey.").into(),
             Self::ShiftNumpad => t("Shift does not work with number pad digits.").into(),
             Self::Duplicate => t("Another Crystal hotkey uses this.").into(),
+            Self::Overlap => t("Another Crystal hotkey fires first on these buttons.").into(),
             Self::InUse => t("Another program already uses this hotkey.").into(),
             Self::Failed(code) => tf("Could not register this hotkey (error {code}).", &[("code", code)]),
         }

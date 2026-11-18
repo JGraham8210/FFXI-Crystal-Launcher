@@ -17,6 +17,11 @@ pub(crate) fn dismiss_disconnect(features: &Option<Runtime>) -> bool {
     features.as_ref().is_some_and(|runtime| runtime.settings().recovery.auto_relaunch)
 }
 
+/// The controller buttons a launch's game hides for the pad hotkeys (`padchord::hide_list`).
+pub(crate) fn pad_hide(features: &Option<Runtime>) -> Vec<[u32; 2]> {
+    features.as_ref().map(Runtime::pad_hide).unwrap_or_default()
+}
+
 impl App {
     /// Start the runtime (nothing runs until something is configured or a game starts).
     pub(crate) fn start_features(&mut self) {
@@ -43,9 +48,13 @@ impl App {
         for (account, report, user_closed) in ended {
             runtime.game_ended(GameEnd { account, report, user_closed, maintenance });
         }
+        // A game this window did not launch (it was restarted while games ran) still hides
+        // what an older list said: each game seen starting hears the current one.
+        let hide = runtime.pad_hide();
         for key in started {
             let Some(row) = self.accounts.iter().find(|row| row.key == key) else { continue };
             let Some(pid) = row.pid else { continue };
+            if !hide.is_empty() { let _ = crate::session_worker::pad_hide::request(&self.config, &row.account, &hide); }
             let slot = self.settings.account_auto_login.get(&key).filter(|login| login.enabled).map(|login| login.character_slot);
             runtime.game_started(GameStart { account: key, slot, label: row.account.label.clone(), pid });
         }
@@ -88,6 +97,15 @@ impl App {
                 crate::launch_log::append_history(&self.config.history_path(), "Crystal", &format!("features: {error}"), None);
             }
             Event::Hotkeys(list) => self.features_view.hotkeys = list,
+            // A rebind takes effect in the running games at once.
+            Event::PadHide(list) => {
+                if self.preview { return; }
+                for row in self.accounts.iter().filter(|row| row.pid.is_some()) {
+                    if let Err(error) = crate::session_worker::pad_hide::request(&self.config, &row.account, &list) {
+                        crate::launch_log::append_history(&self.config.history_path(), "Crystal", &format!("hotkeys: pad buttons not sent to a running game: {error}"), None);
+                    }
+                }
+            }
             // An offer waits on the account until it plays again or it is dismissed; a scheduled
             // relaunch shows from the runtime's pending list.
             Event::Recovery { account, decision } => match decision {

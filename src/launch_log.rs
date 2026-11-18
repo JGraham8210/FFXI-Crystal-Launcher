@@ -23,6 +23,9 @@ pub enum ExitKind {
     Disconnected,
     /// Ended soon after spawn with nothing recognisable in the log.
     Startup,
+    /// Past startup, the host ended with exit status 0 and no exit line, no lost connection and
+    /// no crash dump: a deliberate quit such as Windower's //terminate (`host_exit::DELIBERATE_EXIT`).
+    Ended,
     /// Anything else.
     Other,
     /// The POL-less loader reported an error (its message, one line).
@@ -38,6 +41,9 @@ pub struct ExitReport {
     pub exit_status: Option<i32>,
     /// Whether the client ended inside the startup window.
     pub during_startup: bool,
+    /// The host wrote a crash dump before it ended.
+    #[serde(default)]
+    pub crash_dump: bool,
     /// One English line for the history file and logs; the Accounts page shows
     /// `message()`, the same line in the current language.
     pub summary: String,
@@ -46,7 +52,7 @@ pub struct ExitReport {
 impl ExitReport {
     /// Everything except a clean quit is worth the user's attention.
     pub fn is_problem(&self) -> bool {
-        self.kind != ExitKind::Normal
+        !matches!(self.kind, ExitKind::Normal | ExitKind::Ended)
     }
 
     /// `summary` in the current language, worded from the report's fields.
@@ -65,6 +71,7 @@ impl ExitReport {
             ExitKind::Code { code } if startup => tf("Game exited during startup with code {code}", &[("code", code)]),
             ExitKind::Code { code } => tf("Game exited with code {code}", &[("code", code)]),
             ExitKind::Disconnected => t("Game closed after losing its connection").into(),
+            ExitKind::Ended => t("Game closed").into(),
             ExitKind::Startup => match process {
                 Some(code) => tf("Game exited during startup (process exit {code})", &[("code", &code)]),
                 None => t("Game exited during startup").into(),
@@ -85,7 +92,7 @@ impl ExitReport {
 
     /// A report whose `summary` is its English message.
     fn new(kind: ExitKind, exit_status: Option<i32>, during_startup: bool) -> Self {
-        let mut report = ExitReport { kind, exit_status, during_startup, summary: String::new() };
+        let mut report = ExitReport { kind, exit_status, during_startup, crash_dump: false, summary: String::new() };
         report.summary = report.message_in(Lang::En);
         report
     }
@@ -119,9 +126,28 @@ pub enum LoaderEnd {
     Disconnected,
 }
 
+/// What the host's process left behind (`host_exit::End::evidence`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostExit {
+    /// Its exit status; `None` when unread.
+    pub status: Option<u32>,
+    /// It wrote a crash dump.
+    pub dump: bool,
+    /// It reported `game_disconnected` first.
+    pub disconnected: bool,
+}
+
 /// Classify a loader session's end. `ran` is measured from when the session was handed over.
 pub fn classify_loader_end(end: &LoaderEnd, ran: Duration) -> ExitReport {
+    classify_host_end(end, ran, HostExit::default())
+}
+
+/// `classify_loader_end` with the host's own evidence. A pipe that closed without an exit line
+/// past startup is `Ended` only on a deliberate exit status; a lost connection first makes it a
+/// disconnect; anything else stays an unexpected close, with its status for Recovery to read.
+pub fn classify_host_end(end: &LoaderEnd, ran: Duration, host: HostExit) -> ExitReport {
     let during_startup = ran < STARTUP_WINDOW && !matches!(end, LoaderEnd::SignedOut | LoaderEnd::Terminated);
+    let status = host.status.map(|code| code as i32);
     let (kind, exit_status) = match end {
         LoaderEnd::SignedOut => (ExitKind::Normal, Some(0)),
         LoaderEnd::Terminated => (ExitKind::Normal, None),
@@ -131,10 +157,14 @@ pub fn classify_loader_end(end: &LoaderEnd, ran: Duration) -> ExitReport {
         LoaderEnd::Error(message) => {
             (ExitKind::LoaderError { message: message.chars().take(160).collect() }, None)
         }
-        LoaderEnd::Closed if during_startup => (ExitKind::Startup, None),
-        LoaderEnd::Closed => (ExitKind::Other, None),
+        LoaderEnd::Closed if during_startup => (ExitKind::Startup, status),
+        LoaderEnd::Closed if host.disconnected => (ExitKind::Disconnected, status),
+        LoaderEnd::Closed if host.status == Some(crate::host_exit::DELIBERATE_EXIT) && !host.dump => (ExitKind::Ended, status),
+        LoaderEnd::Closed => (ExitKind::Other, status),
     };
-    ExitReport::new(kind, exit_status, during_startup)
+    let mut report = ExitReport::new(kind, exit_status, during_startup);
+    report.crash_dump = host.dump;
+    report
 }
 
 /// What a supervisor needs to describe and record one launch when it ends.
@@ -344,6 +374,36 @@ mod tests {
         assert!(lost.is_problem());
     }
 
+    /// A closed pipe is a deliberate quit only on the host's exit status 0 (Windower's
+    /// //terminate, Ashita's /terminate), with no dump and no lost connection, past startup.
+    #[test]
+    fn a_closed_pipe_is_judged_by_the_hosts_exit_status() {
+        crate::i18n::set(crate::i18n::Lang::En);
+        let (long, short) = (Duration::from_secs(600), Duration::from_secs(5));
+        let host = |status: Option<u32>, dump, disconnected| HostExit { status, dump, disconnected };
+        let closed = |ran, evidence| classify_host_end(&LoaderEnd::Closed, ran, evidence);
+        let ended = closed(long, host(Some(0), false, false));
+        assert_eq!((ended.kind.clone(), ended.exit_status, ended.summary.as_str()), (ExitKind::Ended, Some(0), "Game closed"));
+        assert!(!ended.is_problem() && !ended.crash_dump);
+        // Task Manager (1), Process.Kill (-1), an access violation, an unread status.
+        for (status, summary) in [(Some(1), "Game closed unexpectedly (process exit 1)"), (Some(u32::MAX), "Game closed unexpectedly (process exit -1)"),
+            (Some(0xC000_0005), "Game closed unexpectedly (process exit -1073741819)"), (None, "Game closed unexpectedly")] {
+            let report = closed(long, host(status, false, false));
+            assert_eq!((report.kind.clone(), report.summary.as_str()), (ExitKind::Other, summary));
+            assert!(report.is_problem());
+        }
+        let dumped = closed(long, host(Some(0), true, false));
+        assert_eq!(dumped.kind, ExitKind::Other);
+        assert!(dumped.crash_dump, "a dump is a crash whatever the status");
+        assert_eq!(closed(long, host(Some(0), false, true)).kind, ExitKind::Disconnected, "a lost connection first is a disconnect");
+        let early = closed(short, host(Some(0), false, false));
+        assert_eq!((early.kind, early.during_startup), (ExitKind::Startup, true), "a terminate during startup stays a startup end");
+        // Ends with their own exit line ignore the host's status; old records read back.
+        assert_eq!(classify_host_end(&LoaderEnd::Exit(-14), long, host(Some(0), false, false)).kind, ExitKind::Code { code: -14 });
+        let old: ExitReport = serde_json::from_str(r#"{"kind":"Other","exit_status":null,"during_startup":false,"summary":"x"}"#).unwrap();
+        assert!(!old.crash_dump);
+    }
+
     #[test]
     fn acknowledged_native_sign_out_is_clean_even_inside_the_startup_window() {
         let short = Duration::from_secs(5);
@@ -380,6 +440,7 @@ mod tests {
             ExitReport::other(Some(1)),
             ExitReport::other(None),
             classify_loader_end(&LoaderEnd::Disconnected, long),
+            classify_host_end(&LoaderEnd::Closed, long, HostExit { status: Some(0), ..HostExit::default() }),
         ];
         for report in &reports {
             assert_eq!(report.message(), report.summary, "{report:?}");
@@ -537,7 +598,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("logs")).unwrap();
         let log = dir.join("logs").join("a.stderr.log");
-        let history = dir.join("iced-launcher").join("launch-history.log");
+        let history = crate::storage::Layout::at(&dir).history();
         let session = Session { history: history.clone(), label: "Main".into(), log: log.clone() };
         let report = classify_loader_end(&LoaderEnd::Error("FFXiMain.dll not found".into()), Duration::from_secs(3));
         session.record(&report.summary);

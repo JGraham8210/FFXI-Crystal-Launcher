@@ -1,5 +1,6 @@
-//! `crystal-loader.log` next to the executable: stages and errors only. Never
-//! pass session values, pipe payloads or anything derived from them to `log!`.
+//! `crystal-loader.log` in Crystal's `Logs` folder (`data_paths::logs`), shared by
+//! every host however it was installed: stages and errors only. Never pass session
+//! values, pipe payloads or anything derived from them to `log!`.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -11,20 +12,26 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 static SINK: Mutex<Option<File>> = Mutex::new(None);
 static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// The log file's path once [`init`] opened it; its folder also holds the
-/// per-build feature check.
+/// The log file's path once [`init`] opened it.
 pub fn path() -> Option<&'static Path> {
     PATH.get().map(PathBuf::as_path)
 }
 
-const MAX_LOG_BYTES: u64 = 1 << 20;
-pub const LOG_NAME: &str = "crystal-loader.log";
+/// The folder this host runs from: its per-build feature checks live beside it.
+pub fn host_dir() -> Option<PathBuf> {
+    std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf))
+}
 
-/// Opens the log next to the executable (falls back to %TEMP% if that folder is
-/// read-only). Returns the path used.
+const MAX_LOG_BYTES: u64 = 1 << 20;
+pub const LOG_NAME: &str = crate::data_paths::LOADER_LOG;
+
+/// Opens the log in Crystal's `Logs` folder; else beside the executable, else in %TEMP%
+/// (a folder that cannot be written). Returns the path used.
 pub fn init() -> Option<PathBuf> {
-    let beside_exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(LOG_NAME)));
-    let candidates = beside_exe.into_iter().chain(std::iter::once(std::env::temp_dir().join(LOG_NAME)));
+    let logs = crate::data_paths::logs();
+    let in_logs = std::fs::create_dir_all(&logs).ok().map(|()| logs.join(LOG_NAME));
+    let beside_exe = host_dir().map(|d| d.join(LOG_NAME));
+    let candidates = in_logs.into_iter().chain(beside_exe).chain(std::iter::once(std::env::temp_dir().join(LOG_NAME)));
     for path in candidates {
         if let Some(f) = open(&path) {
             *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
@@ -152,6 +159,20 @@ pub fn write(msg: std::fmt::Arguments<'_>) {
 #[macro_export]
 macro_rules! log {
     ($($t:tt)*) => { $crate::log::write(format_args!($($t)*)) };
+}
+
+/// A line that also belongs in this game's own log in `Logs\games` (auto-login retries,
+/// disconnects, how the game ended): written here and sent to the launcher as a `log` event.
+/// The same rule as `log!`: never session values or anything derived from them.
+#[macro_export]
+macro_rules! key_log {
+    ($($t:tt)*) => { $crate::log::key(format_args!($($t)*)) };
+}
+
+pub fn key(msg: std::fmt::Arguments<'_>) {
+    let text = msg.to_string();
+    write(format_args!("{text}"));
+    crate::events::send(crate::proto::key_line(&text));
 }
 
 #[cfg(test)]

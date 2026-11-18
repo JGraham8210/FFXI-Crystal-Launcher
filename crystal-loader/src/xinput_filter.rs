@@ -6,8 +6,13 @@
 //! here. Unless the game's "keep working in the background" flag is on or this
 //! process owns the foreground window, pad state reads as connected and idle,
 //! and vibration is not sent. Everything else is forwarded unchanged.
+//!
+//! A read that is passed on has the buttons Crystal's pad hotkeys take hidden
+//! (`pad_hide`): each binding's trigger is cleared while all its modifiers are
+//! held. The same in every game, in front or kept working in the background.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crate::pad_hide::{Entry, GUIDE, LT, MAX_ENTRIES, RT};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use windows_sys::Win32::{
     Foundation::{GetLastError, SetLastError, HMODULE},
     System::Threading::GetCurrentProcessId,
@@ -118,14 +123,60 @@ fn background(flag: usize, served: impl FnOnce() -> Option<bool>) -> Option<bool
 
 /// The real result, so connection changes stay honest; a withheld read is the
 /// whole 16-byte XINPUT_STATE zeroed (packet number too, so a game comparing
-/// packet numbers still sees held buttons released).
-fn get(real: impl FnOnce(*mut u8) -> u32, state: *mut u8, withheld: impl FnOnce() -> bool) -> u32 {
+/// packet numbers still sees held buttons released). Any other read goes
+/// through `hide`.
+fn get(real: impl FnOnce(*mut u8) -> u32, state: *mut u8, withheld: impl FnOnce() -> bool, hide: impl FnOnce(&mut [u8; 16])) -> u32 {
     let result = real(state);
-    if result == 0 && !state.is_null() && withheld() {
-        // SAFETY: the caller's XINPUT_STATE, just filled by the real function.
-        unsafe { state.write_bytes(0, 16) };
+    if result == 0 && !state.is_null() {
+        if withheld() {
+            // SAFETY: the caller's XINPUT_STATE, just filled by the real function.
+            unsafe { state.write_bytes(0, 16) };
+        } else {
+            // SAFETY: as above; XINPUT_STATE is 16 bytes, byte-aligned here.
+            hide(unsafe { &mut *state.cast::<[u8; 16]>() });
+        }
     }
     result
+}
+
+/// The pad hotkeys' bindings: modifiers in the low half, the trigger in the high
+/// half; the first `HIDE_COUNT` are live.
+static HIDE: [AtomicU64; MAX_ENTRIES] = [const { AtomicU64::new(0) }; MAX_ENTRIES];
+static HIDE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Replace the buttons Crystal's pad hotkeys take (session line, then each
+/// `pad_hide` command). Reads during the swap hide nothing.
+pub(crate) fn set_hide(entries: &[Entry]) {
+    HIDE_COUNT.store(0, Ordering::Release);
+    for (slot, [mods, trigger]) in HIDE.iter().zip(entries) {
+        slot.store(u64::from(*mods) | u64::from(*trigger) << 32, Ordering::Relaxed);
+    }
+    HIDE_COUNT.store(entries.len().min(MAX_ENTRIES), Ordering::Release);
+}
+
+fn hide_entries() -> impl Iterator<Item = (u32, u32)> {
+    HIDE[..HIDE_COUNT.load(Ordering::Acquire)].iter().map(|slot| {
+        let packed = slot.load(Ordering::Relaxed);
+        (packed as u32, (packed >> 32) as u32)
+    })
+}
+
+/// Clear each binding's trigger whose modifiers are all held, in a filled
+/// XINPUT_STATE (`wButtons` at 4, the triggers at 6 and 7; a trigger counts as
+/// held at 128, and a hidden one reads 0). Modifiers are never touched. Guide
+/// only with `ex` (`XInputGetStateEx`): no other read reports it.
+fn hide(state: &mut [u8; 16], entries: impl Iterator<Item = (u32, u32)>, ex: bool) {
+    let buttons = u16::from_le_bytes([state[4], state[5]]);
+    let held = u32::from(buttons) | if state[6] >= 128 { LT } else { 0 } | if state[7] >= 128 { RT } else { 0 };
+    let clear = entries.filter(|(mods, trigger)| held & mods == *mods && (ex || *trigger != GUIDE)).fold(0, |all, (_, trigger)| all | trigger);
+    if clear == 0 { return; }
+    state[4..6].copy_from_slice(&(buttons & !(clear as u16)).to_le_bytes());
+    if clear & LT != 0 { state[6] = 0; }
+    if clear & RT != 0 { state[7] = 0; }
+}
+
+fn hide_now(state: &mut [u8; 16], ex: bool) {
+    if HIDE_COUNT.load(Ordering::Acquire) != 0 { hide(state, hide_entries(), ex); }
 }
 
 /// Whether vibration this game sent may still be running.
@@ -153,7 +204,7 @@ macro_rules! wrappers {
             let f = real_fn($get_kind);
             if f == 0 { return ERROR_DEVICE_NOT_CONNECTED; }
             let f: unsafe extern $abi fn(u32, *mut u8) -> u32 = unsafe { std::mem::transmute(f) };
-            get(|s| unsafe { f(user, s) }, state, withheld_now)
+            get(|s| unsafe { f(user, s) }, state, withheld_now, |s| hide_now(s, false))
         }
         unsafe extern $abi fn $set(user: u32, vibration: *mut u16) -> u32 {
             let f = real_fn($set_kind);
@@ -171,7 +222,7 @@ unsafe extern "system" fn get_state_ex(user: u32, state: *mut u8) -> u32 {
     let f = real_fn(GET_EX);
     if f == 0 { return ERROR_DEVICE_NOT_CONNECTED; }
     let f: unsafe extern "system" fn(u32, *mut u8) -> u32 = unsafe { std::mem::transmute(f) };
-    get(|s| unsafe { f(user, s) }, state, withheld_now)
+    get(|s| unsafe { f(user, s) }, state, withheld_now, |s| hide_now(s, true))
 }
 
 #[cfg(test)]
@@ -204,15 +255,94 @@ mod tests {
     fn background_reads_are_connected_and_idle() {
         let fill = |s: *mut u8| { unsafe { s.write_bytes(0xAB, 16) }; 0 };
         let mut state = [0xCDu8; 20];
-        assert_eq!(get(fill, state.as_mut_ptr(), || true), 0);
+        assert_eq!(get(fill, state.as_mut_ptr(), || true, |_| panic!("a withheld read hides nothing more")), 0);
         assert_eq!(state[..16], [0; 16]);
         assert_eq!(state[16..], [0xCD; 4], "only XINPUT_STATE is written");
-        assert_eq!(get(fill, state.as_mut_ptr(), || false), 0);
+        assert_eq!(get(fill, state.as_mut_ptr(), || false, |_| {}), 0);
         assert_eq!(state[..16], [0xAB; 16]);
         // A missing pad stays missing.
         let mut state = [0xABu8; 16];
-        assert_eq!(get(|_| ERROR_DEVICE_NOT_CONNECTED, state.as_mut_ptr(), || panic!("not asked")), ERROR_DEVICE_NOT_CONNECTED);
+        assert_eq!(get(|_| ERROR_DEVICE_NOT_CONNECTED, state.as_mut_ptr(), || panic!("not asked"), |_| panic!("not asked")), ERROR_DEVICE_NOT_CONNECTED);
         assert_eq!(state, [0xAB; 16]);
+    }
+
+    /// An XINPUT_STATE with these buttons and trigger bytes (packet 7, sticks set).
+    fn pad(buttons: u16, lt: u8, rt: u8) -> [u8; 16] {
+        let mut s = [0x11u8; 16];
+        s[..4].copy_from_slice(&7u32.to_le_bytes());
+        s[4..6].copy_from_slice(&buttons.to_le_bytes());
+        (s[6], s[7]) = (lt, rt);
+        s
+    }
+
+    const BACK: u32 = 0x20;
+    const START: u32 = 0x10;
+    const A: u32 = 0x1000;
+
+    fn hidden(state: [u8; 16], entries: &[(u32, u32)], ex: bool) -> [u8; 16] {
+        let mut out = state;
+        hide(&mut out, entries.iter().copied(), ex);
+        out
+    }
+
+    #[test]
+    fn a_single_button_is_always_hidden_and_a_combo_only_while_its_modifiers_are_held() {
+        // Back alone (FFXI's Hide windows by default) and LT+Start.
+        let entries = [(0, BACK), (LT, START)];
+        assert_eq!(hidden(pad(0x20 | 0x1000, 0, 0), &entries, false), pad(0x1000, 0, 0), "Back gone, A kept");
+        // Start without LT reaches the game; with LT held (128 and up) it does not, and LT does.
+        assert_eq!(hidden(pad(0x10, 0, 0), &entries, false), pad(0x10, 0, 0));
+        assert_eq!(hidden(pad(0x10, 127, 0), &entries, false), pad(0x10, 127, 0), "below the threshold LT is not held");
+        assert_eq!(hidden(pad(0x10, 128, 0), &entries, false), pad(0, 128, 0));
+        assert_eq!(hidden(pad(0x10, 255, 9), &entries, false), pad(0, 255, 9));
+        // Nothing bound: untouched, packet number and sticks too.
+        assert_eq!(hidden(pad(0xFFFF, 255, 255), &[], true), pad(0xFFFF, 255, 255));
+    }
+
+    #[test]
+    fn a_trigger_as_the_bound_button_reads_released() {
+        // RT alone; A+LT.
+        let entries = [(0, RT), (A, LT)];
+        assert_eq!(hidden(pad(0, 200, 200), &entries, false), pad(0, 200, 0));
+        assert_eq!(hidden(pad(0x1000, 200, 200), &entries, false), pad(0x1000, 0, 0));
+        // RT as a modifier stays; its combo's trigger goes.
+        assert_eq!(hidden(pad(0x20, 0, 255), &[(RT, BACK)], false), pad(0, 0, 255));
+    }
+
+    #[test]
+    fn guide_is_hidden_only_from_the_read_that_reports_it() {
+        let entries = [(0, GUIDE), (BACK, GUIDE)];
+        assert_eq!(hidden(pad(0x0400 | 0x1000, 0, 0), &entries, true), pad(0x1000, 0, 0));
+        assert_eq!(hidden(pad(0x0400, 0, 0), &entries, false), pad(0x0400, 0, 0), "XInputGetState never reports Guide");
+    }
+
+    #[test]
+    fn background_zeroing_comes_first_and_hiding_follows_in_front() {
+        let fill = |s: *mut u8| { unsafe { s.copy_from(pad(0x20 | 0x10, 0, 0).as_ptr(), 16) }; 0 };
+        let entries = [(0, BACK)];
+        let mut state = [0u8; 16];
+        // In the background the whole read is zeroed, as before.
+        assert_eq!(get(fill, state.as_mut_ptr(), || true, |s| hide(s, entries.iter().copied(), false)), 0);
+        assert_eq!(state, [0; 16]);
+        // In front: Back hidden, Start kept.
+        assert_eq!(get(fill, state.as_mut_ptr(), || false, |s| hide(s, entries.iter().copied(), false)), 0);
+        assert_eq!(state, pad(0x10, 0, 0));
+    }
+
+    /// The live table: the session's list, replaced whole by each command.
+    #[test]
+    fn the_hide_list_is_replaced_whole() {
+        set_hide(&[[0, BACK], [LT, START]]);
+        assert_eq!(hide_entries().collect::<Vec<_>>(), [(0, BACK), (LT, START)]);
+        let mut state = pad(0x30, 0, 0);
+        hide_now(&mut state, false);
+        assert_eq!(state, pad(0x10, 0, 0));
+        set_hide(&[[0, GUIDE]]);
+        assert_eq!(hide_entries().collect::<Vec<_>>(), [(0, GUIDE)]);
+        set_hide(&[]);
+        let mut state = pad(0x30, 0, 0);
+        hide_now(&mut state, true);
+        assert_eq!(state, pad(0x30, 0, 0), "an empty list hides nothing");
     }
 
     #[test]

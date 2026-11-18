@@ -1,6 +1,6 @@
 //! The 32-bit loader (`pol.exe`) travels inside the launcher exe (`build.rs` embeds it) and is
-//! written to `<data dir>\crystal\pol.exe` when a matching installed host is unavailable.
-//! The loader writes its own log beside itself, so both locations stay user-writable.
+//! written to `Runtime\host\pol.exe` (`storage`) when a matching installed host is unavailable.
+//! Both locations stay user-writable: the host keeps its feature checks beside itself.
 //!
 //! The file is rewritten only when its SHA-256 differs from the embedded one, through a
 //! temporary file renamed into place (`fsutil::write_atomic`): sign-ins starting in parallel
@@ -46,9 +46,9 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     text
 }
 
-/// The launcher's per-user data folder, where `crystal\` lives.
+/// The launcher's `Runtime` folder, where `host\` lives.
 pub(crate) fn data_dir() -> PathBuf {
-    crate::backend::Config::default().experiment.join("iced-launcher")
+    crate::storage::Layout::current().runtime()
 }
 
 /// Extracts the embedded loader under the launcher's data folder; `None` when this build embeds
@@ -79,7 +79,7 @@ fn write(path: &Path, bytes: &[u8], hash: &str) -> io::Result<()> {
 /// Puts the loader in `<root>\crystal` and returns the path to run. The standard
 /// `crystal\pol.exe` when it already matches or can be replaced, else `crystal\<hash8>\pol.exe`.
 pub(crate) fn extract_into(root: &Path, bytes: &[u8], hash: &str) -> io::Result<PathBuf> {
-    let crystal = root.join("crystal");
+    let crystal = crate::storage::host_dir(root);
     let standard = crystal.join("pol.exe");
     let path = if has_hash(&standard, hash) || write(&standard, bytes, hash).is_ok() {
         standard
@@ -137,9 +137,9 @@ mod tests {
         let root = temp("fresh");
         let bytes = b"loader one";
         let path = extract_into(&root, bytes, &sha256_hex(bytes)).unwrap();
-        assert_eq!(path, root.join("crystal").join("pol.exe"));
+        assert_eq!(path, crate::storage::host_dir(&root).join("pol.exe"));
         assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(fs::read_dir(root.join("crystal")).unwrap().count(), 1, "no temp file is left");
+        assert_eq!(fs::read_dir(crate::storage::host_dir(&root)).unwrap().count(), 1, "no temp file is left");
         // The same hash is not rewritten.
         let before = fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -163,7 +163,7 @@ mod tests {
         let _held = fs::OpenOptions::new().read(true).share_mode(1).open(&standard).unwrap();
         let hash = sha256_hex(new);
         let path = extract_into(&root, new, &hash).unwrap();
-        assert_eq!(path, root.join("crystal").join(&hash[..8]).join("pol.exe"));
+        assert_eq!(path, crate::storage::host_dir(&root).join(&hash[..8]).join("pol.exe"));
         assert_eq!(fs::read(&path).unwrap(), new);
         assert_eq!(fs::read(&standard).unwrap(), old, "the running file is left alone");
         // A later launch reuses the versioned copy.
@@ -184,8 +184,8 @@ mod tests {
         for path in paths {
             assert!(has_hash(&path, &hash), "{}", path.display());
         }
-        assert!(has_hash(&root.join("crystal").join("pol.exe"), &hash));
-        assert!(fs::read_dir(root.join("crystal")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+        assert!(has_hash(&crate::storage::host_dir(&root).join("pol.exe"), &hash));
+        assert!(fs::read_dir(crate::storage::host_dir(&root)).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -194,7 +194,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         use std::time::{Duration, SystemTime};
         let root = temp("prune");
-        let crystal = root.join("crystal");
+        let crystal = crate::storage::host_dir(&root);
         let age = |path: &Path, when: SystemTime| {
             // FILE_WRITE_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS opens a folder too.
             fs::OpenOptions::new().access_mode(0x0100).custom_flags(0x0200_0000).open(path).unwrap().set_modified(when).unwrap();

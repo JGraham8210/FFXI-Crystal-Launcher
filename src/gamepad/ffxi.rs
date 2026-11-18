@@ -474,7 +474,7 @@ pub(crate) struct Loaded {
 }
 
 fn backup_dir(config: &crate::backend::Config) -> PathBuf {
-    config.experiment.join("iced-launcher/gamepad-backup")
+    config.layout().gamepad_backup()
 }
 
 /// Writes `bytes` to `path` only if it does not exist yet: the first backup is

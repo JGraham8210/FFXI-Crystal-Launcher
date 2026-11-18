@@ -47,18 +47,18 @@ impl Region {
 /// The launcher's own files, from its configuration.
 #[derive(Clone, Debug)]
 pub(crate) struct Paths {
-    pub launcher: PathBuf,
+    pub layout: crate::storage::Layout,
 }
 
 impl Paths {
     pub(crate) fn from_config(config: &crate::backend::Config) -> Self {
-        Self { launcher: config.experiment.join("iced-launcher") }
+        Self { layout: config.layout() }
     }
     pub(crate) fn backups(&self) -> PathBuf {
-        self.launcher.join("game-config-backups")
+        self.layout.game_config_backups()
     }
     fn menu_file(&self, region: Region) -> PathBuf {
-        self.launcher.join(format!("menu-{}.json", region.vendor().to_ascii_lowercase()))
+        self.layout.menu(region.vendor())
     }
 }
 /// A menu size explicitly applied in Crystal survives an injector rewriting the
@@ -91,8 +91,9 @@ fn save_menu(paths: &Paths, region: Region, size: (u32, u32)) -> Result<(), Stri
             Err(_) => Err(tf("Could not save {path}.", &[("path", &path.display())])),
         };
     }
-    std::fs::create_dir_all(&paths.launcher)
-        .map_err(|_| tf("Could not create {path}.", &[("path", &paths.launcher.display())]))?;
+    let folder = paths.layout.data();
+    std::fs::create_dir_all(&folder)
+        .map_err(|_| tf("Could not create {path}.", &[("path", &folder.display())]))?;
     crate::fsutil::write_atomic(&path, &serde_json::to_vec(&size).expect("integer pair"))
         .map_err(|_| tf("Could not save {path}.", &[("path", &path.display())]))
 }
@@ -372,7 +373,7 @@ mod tests {
     }
 
     fn fake_paths(root: &Path) -> Paths {
-        Paths { launcher: root.join("iced-launcher") }
+        Paths { layout: crate::storage::Layout::at(root) }
     }
 
     #[test]

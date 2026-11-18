@@ -1,6 +1,6 @@
 //! The startup self-check: once FFXiMain is resolved, one log line names
 //! every Crystal feature this client (and Windower Hook) build switches off,
-//! and why, and the same result is saved beside the log as
+//! and why, and the same result is saved beside the host's exe as
 //! `crystal-features.json` for the launcher's Settings page. The file is
 //! rewritten only when the build pair or a result changes, so it is written
 //! once per build. Nothing here reads or writes the game; it only reports
@@ -162,7 +162,7 @@ pub(crate) fn report_pol(layout: Option<&crate::pol_core::Layout>, result: Resul
     let build = layout.map(|l| (l.timestamp, crate::pol_core::known(l.timestamp)));
     let features = pol_features(result, crate::pe::this_process_large_address_aware());
     log!("{}", pol_summary(build, &features));
-    let Some(dir) = log::path().and_then(std::path::Path::parent) else { return };
+    let Some(dir) = log::host_dir() else { return };
     if let Err(error) = save(&dir.join(POL_FILE), &pol_json(build, &features)) {
         log!("note: POL feature check could not be saved: {error}");
     }
@@ -183,7 +183,7 @@ pub(crate) fn report(game: &'static game_layout::Resolution) {
     #[cfg(not(target_arch = "x86"))]
     let hook_build: HookBuild = None;
     log!("{}", summary(game.timestamp, hook_build, &features));
-    let Some(dir) = log::path().and_then(std::path::Path::parent) else { return };
+    let Some(dir) = log::host_dir() else { return };
     match save(&dir.join(FILE), &json(game.timestamp, hook_build, &features)) {
         Ok(true) => log!("feature check: saved for this build pair ({FILE})"),
         Ok(false) => {}

@@ -1,4 +1,4 @@
-//! The launcher's saved settings (`iced-launcher/settings.json`): the struct, its defaults and
+//! The launcher's saved settings (`Data\settings.json`, `storage`): the struct, its defaults and
 //! the capped, atomic file load and save.
 
 use crate::backend::{self, account_key, Account, Config};
@@ -27,6 +27,9 @@ pub(crate) struct Settings {
     pub(crate) selected_accounts: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub account_order: Vec<String>,
+    /// Saved picks of accounts (the rail's Select menu).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub account_groups: Vec<crate::selection::Group>,
     /// Public setup names; account credentials stay in the unchanged DPAPI vault.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub account_pol_handles: HashMap<String, String>,
@@ -134,6 +137,7 @@ impl Default for Settings {
             installer_region: None,
             selected_accounts: None,
             account_order: Vec::new(),
+            account_groups: Vec::new(),
             account_pol_handles: HashMap::new(),
             launch_with: crate::backend::LaunchWith::default(),
             ashita_path: String::new(),
@@ -178,7 +182,7 @@ pub(crate) fn installer_folder(region: crate::retail_region::RetailRegion) -> St
         crate::retail_region::RetailRegion::Us => "official-installer".to_owned(),
         other => format!("official-installer-{}", other.wire()),
     };
-    Config::default().experiment.join(name).to_string_lossy().into_owned()
+    Config::default().layout().installer_downloads(&name).to_string_lossy().into_owned()
 }
 
 /// `\\?\C:\x` -> `C:\x` for a path kept as text; anything else is left alone.
@@ -246,7 +250,7 @@ impl Settings {
 }
 
 pub(crate) fn settings_path(config: &Config) -> PathBuf {
-    config.experiment.join("iced-launcher/settings.json")
+    config.layout().settings()
 }
 
 /// Loads the saved settings and sets the UI language from them: the Windows

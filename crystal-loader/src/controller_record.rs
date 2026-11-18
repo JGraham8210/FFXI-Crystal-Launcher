@@ -31,8 +31,7 @@ fn hash(bytes: &[u8]) -> Option<[u8; 32]> {
     (unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, std::ptr::null(), 0, bytes.as_ptr(), u32::try_from(bytes.len()).ok()?, result.as_mut_ptr(), 32) } >= 0).then_some(result)
 }
 pub(crate) fn root() -> Option<PathBuf> {
-    std::env::var_os("CRYSTAL_DATA_ROOT").or_else(|| std::env::var_os("LOCALAPPDATA"))
-        .map(|p| PathBuf::from(p).join("Crystal Launcher/controller-discovery"))
+    Some(crate::data_paths::controller_discovery())
 }
 fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;

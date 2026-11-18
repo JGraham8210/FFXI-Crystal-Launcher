@@ -41,6 +41,9 @@ export struct FeatureStrings {
     /// A hotkey field with no hotkey.
     hotkey-none: string,
     hotkey-note: string,
+    /// The hotkey rows' column heads.
+    keyboard: string,
+    controller: string,
     no-accounts: string,
     recovery: string,
     offer: string,
@@ -143,6 +146,11 @@ export struct HotkeyLine {
     active: bool,
     /// `problem` is a warning: the hotkey works.
     warn: bool,
+    /// The controller's chord for the same job, and what to know about it.
+    pad-text: string,
+    pad-problem: string,
+    pad-warn: bool,
+    pad-active: bool,
 }
 
 /// One account's client settings.
@@ -234,6 +242,11 @@ export global Features {
     /// The host's keyboard hook took the key that ended the last recording: the field never
     /// saw its press, so that key's repeats arrive looking like new presses.
     in property <bool> recording-taken;
+    /// The controller field that is recording (numbered as `recording`), or -1, and what it
+    /// shows meanwhile: the prompt (`pad-recording-prompt`), or the buttons held ("LT+…").
+    in property <int> pad-recording: -1;
+    in property <string> pad-recording-text;
+    in property <bool> pad-recording-prompt;
     // ---- recovery ----
     in property <bool> offer;
     in property <bool> auto-relaunch;
@@ -288,6 +301,13 @@ export global Features {
     /// key's text, Ctrl, Alt, Shift and the Windows key held, and pressed or released. Whether
     /// the key was the recording's.
     callback hotkey-key(string, bool, bool, bool, bool, bool) -> bool;
+    /// A controller field (numbered as `hotkey-record`): starts recording; stops without a
+    /// change (Esc, Tab, the focus left); is cleared (Backspace, Delete); the pointer went down
+    /// on it.
+    callback pad-record(int);
+    callback pad-cancel(int);
+    callback pad-clear(int);
+    callback pad-pointer(int);
     /// The pointer on the map: 0 pressed, 1 moved, 2 released, 3 the press was taken away; where
     /// it is as fractions of the map, how wide the map is drawn, and whether Alt is held.
     callback map-pointer(int, float, float, length, bool);
@@ -472,27 +492,150 @@ component HotkeyField inherits Rectangle {
     }
 }
 
-/// A hotkey row: what it does, the hotkey's field with what to know about it under it, and its
-/// state.
+/// A controller hotkey, set by pressing it: a click, Return or Space starts recording, the field
+/// shows `live` (the prompt, then the buttons held), and the first release takes the chord (the
+/// host reads the controllers). Esc or Tab cancels; Backspace or Delete clears it.
+component PadField inherits Rectangle {
+    in property <string> label;
+    in property <string> chord;
+    in property <string> none;
+    in property <bool> recording;
+    in property <string> live;
+    in property <bool> prompt;
+    callback record();
+    callback cancel();
+    callback clear();
+    callback pointer();
+    height: Theme.control-h;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius-mid;
+    border-width: 1px;
+    background: root.recording ? Theme.select : Theme.field;
+    border-color: root.recording || focus.has-focus ? Theme.accent : hit.has-hover ? Theme.line.mix(Theme.accent, 0.5) : Theme.line;
+    animate background { duration: Theme.quick; }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.recording ? root.live : root.chord == "" ? root.none : root.chord;
+    accessible-action-default => { root.record(); }
+    forward-focus: focus;
+    focus := FocusScope {
+        focus-on-click: false;
+        focus-gained(reason) => { Nav.keyboard = reason == FocusReason.tab-navigation; }
+        focus-lost => { if root.recording { root.cancel(); } }
+        key-pressed(event) => {
+            if root.recording {
+                if event.text == Key.Escape { root.cancel(); return accept; }
+                if event.text == Key.Backspace || event.text == Key.Delete { root.clear(); return accept; }
+                if event.text == Key.Tab || event.text == Key.Backtab { root.cancel(); return reject; }
+                return accept;
+            }
+            if event.repeat { return reject; }
+            if event.text == Key.Return || event.text == " " {
+                root.record();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    hit := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down { root.pointer(); }
+        }
+        clicked => {
+            focus.focus();
+            root.record();
+        }
+    }
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 8px;
+        spacing: Theme.sp-s;
+        Text {
+            horizontal-stretch: 1;
+            text: root.recording ? root.live : root.chord == "" ? root.none : root.chord;
+            font-family: (root.recording && root.prompt) || (!root.recording && root.chord == "") ? Theme.sans : Theme.mono;
+            font-size: (root.recording && root.prompt) || (!root.recording && root.chord == "") ? Theme.type-small : 12px;
+            font-weight: root.recording ? 500 : 400;
+            color: root.recording ? Theme.select-ink : root.chord == "" ? Theme.faint : Theme.ink;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.recording: KeyCap {
+            cross-axis-self-alignment: center;
+            text: "Esc";
+            ink: Theme.select-ink;
+            edge: Theme.select-ink.with-alpha(0.4);
+        }
+    }
+    if focus.has-focus && Nav.keyboard && !root.recording: Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: root.border-radius + 3px;
+        border-width: 2px;
+        border-color: Theme.accent;
+    }
+}
+
+/// The hotkey fields' width: fixed beside the name; in the small window, where the name has a
+/// line of its own, the two share the row up to their usual width.
+global HotkeyColumns {
+    out property <length> field: Theme.small ? 150px : 200px;
+    out property <length> least: Theme.small ? 90px : 200px;
+}
+
+/// The column heads over the hotkey rows' two fields.
+component HotkeyHeads inherits HorizontalLayout {
+    spacing: 16px;
+    if !Theme.small: Rectangle { horizontal-stretch: 1; }
+    for head in [Features.strings.keyboard, Features.strings.controller]: Text {
+        min-width: HotkeyColumns.least;
+        preferred-width: HotkeyColumns.field;
+        max-width: HotkeyColumns.field;
+        horizontal-stretch: Theme.small ? 1 : 0;
+        text: head;
+        font-size: Theme.type-small;
+        color: Theme.faint;
+        overflow: elide;
+    }
+    Rectangle { width: 16px; }
+}
+
+/// A hotkey row: what it does, the keyboard's and the controller's fields with what to know
+/// about them under them, and the keyboard hotkey's state.
 component HotkeyRow inherits Rectangle {
     in property <HotkeyLine> line;
     in property <string> none;
     in property <bool> recording;
+    in property <bool> pad-recording;
     in property <bool> closing;
     callback record();
     callback pointer();
     callback blur();
+    callback pad-record();
+    callback pad-cancel();
+    callback pad-clear();
+    callback pad-pointer();
     min-height: 48px;
     Rule { y: 0px; width: parent.width; }
     VerticalLayout {
         padding-top: 6px;
         padding-bottom: 6px;
         spacing: Theme.sp-xs;
+        // In the small window the name has a line of its own above the two fields, so it keeps
+        // its words; the fields stay in their columns.
+        if Theme.small: Text {
+            text: root.line.name;
+            font-size: Theme.type-body;
+            font-weight: 500;
+            color: Theme.ink;
+            overflow: elide;
+        }
         HorizontalLayout {
             spacing: 16px;
-            // The field is narrower in the small window, so the name keeps its words; the fields
-            // stay one column.
-            Text {
+            if !Theme.small: Text {
                 horizontal-stretch: 1;
                 text: root.line.name;
                 font-size: Theme.type-body;
@@ -502,7 +645,10 @@ component HotkeyRow inherits Rectangle {
                 overflow: elide;
             }
             HotkeyField {
-                width: Theme.small ? 150px : 200px;
+                min-width: HotkeyColumns.least;
+                preferred-width: HotkeyColumns.field;
+                max-width: HotkeyColumns.field;
+                horizontal-stretch: Theme.small ? 1 : 0;
                 label: root.line.name;
                 chord: root.line.text;
                 none: root.none;
@@ -513,6 +659,22 @@ component HotkeyRow inherits Rectangle {
                 pointer => { root.pointer(); }
                 blur => { root.blur(); }
                 key(text, control, alt, shift, meta, down) => { return Features.hotkey-key(text, control, alt, shift, meta, down); }
+            }
+            PadField {
+                min-width: HotkeyColumns.least;
+                preferred-width: HotkeyColumns.field;
+                max-width: HotkeyColumns.field;
+                horizontal-stretch: Theme.small ? 1 : 0;
+                label: root.line.name + " · " + Features.strings.controller;
+                chord: root.line.pad-text;
+                none: root.none;
+                recording: root.pad-recording;
+                live: Features.pad-recording-text;
+                prompt: Features.pad-recording-prompt;
+                record => { root.pad-record(); }
+                cancel => { root.pad-cancel(); }
+                clear => { root.pad-clear(); }
+                pointer => { root.pad-pointer(); }
             }
             VerticalLayout {
                 width: 16px;
@@ -529,6 +691,10 @@ component HotkeyRow inherits Rectangle {
         if root.line.problem != "" && !root.recording: ErrorNote {
             text: root.line.problem;
             color: root.line.warn ? Theme.warn : Theme.danger;
+        }
+        if root.line.pad-problem != "" && !root.pad-recording: ErrorNote {
+            text: root.line.pad-problem;
+            color: root.line.pad-warn ? Theme.warn : Theme.danger;
         }
     }
     if root.closing: Rule { y: parent.height - 1px; width: parent.width; }
@@ -867,15 +1033,21 @@ component HotkeysSection inherits VerticalLayout {
         VerticalLayout {
             spacing: Theme.sp-s;
             GroupLabel { text: Features.strings.switch-windows; }
+            HotkeyHeads { }
             VerticalLayout {
                 for line[index] in Features.cycle-hotkeys: HotkeyRow {
                     line: line;
                     none: Features.strings.hotkey-none;
                     recording: Features.recording == index;
+                    pad-recording: Features.pad-recording == index;
                     closing: index == Features.cycle-hotkeys.length - 1;
                     record => { Features.hotkey-record(index); }
                     pointer => { Features.hotkey-pointer(index); }
                     blur => { Features.hotkey-blur(index); }
+                    pad-record => { Features.pad-record(index); }
+                    pad-cancel => { Features.pad-cancel(index); }
+                    pad-clear => { Features.pad-clear(index); }
+                    pad-pointer => { Features.pad-pointer(index); }
                 }
             }
             Note { text: Features.strings.hotkey-note; }
@@ -885,15 +1057,21 @@ component HotkeysSection inherits VerticalLayout {
         spacing: Theme.sp-s;
         GroupLabel { text: Features.strings.per-account; }
         if Features.account-hotkeys.length == 0: Note { text: Features.strings.no-accounts; }
+        if Features.account-hotkeys.length > 0: HotkeyHeads { }
         VerticalLayout {
             for line[index] in Features.account-hotkeys: HotkeyRow {
                 line: line;
                 none: Features.strings.hotkey-none;
                 recording: Features.recording == index + 2;
+                pad-recording: Features.pad-recording == index + 2;
                 closing: index == Features.account-hotkeys.length - 1;
                 record => { Features.hotkey-record(index + 2); }
                 pointer => { Features.hotkey-pointer(index + 2); }
                 blur => { Features.hotkey-blur(index + 2); }
+                pad-record => { Features.pad-record(index + 2); }
+                pad-cancel => { Features.pad-cancel(index + 2); }
+                pad-clear => { Features.pad-clear(index + 2); }
+                pad-pointer => { Features.pad-pointer(index + 2); }
             }
         }
     }

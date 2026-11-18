@@ -2,7 +2,7 @@
 //! checks the PlayOnline core's contract before each sign-in and saves
 //! `crystal-pol.json`; it resolves FFXiMain (and Windower's Hook.dll) when a
 //! game starts and saves
-//! `crystal-features.json` beside its log, rewritten only when the build pair
+//! `crystal-features.json` beside its exe, rewritten only when the build pair
 //! or a result changes. This card shows the newest one: which game and
 //! Windower builds it covers and every Crystal feature they switch off, with
 //! the reason. Nothing here reads the game.

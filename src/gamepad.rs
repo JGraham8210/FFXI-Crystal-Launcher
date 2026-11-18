@@ -13,6 +13,8 @@
 mod art;
 pub(crate) mod detect;
 mod ffxi;
+pub(crate) mod pad_facts;
+pub(crate) mod padswitch;
 
 use crate::i18n::{t, tf};
 use crate::palette::{colors, Color};
@@ -427,7 +429,7 @@ pub(crate) fn watching(state: &State) -> bool {
     !(state.preview && !crate::preview_idle())
 }
 
-fn btn_label(family: Family, b: Btn) -> &'static str {
+pub(crate) fn btn_label(family: Family, b: Btn) -> &'static str {
     let ps = family.is_playstation();
     let nin = family == Family::SwitchPro;
     match b {

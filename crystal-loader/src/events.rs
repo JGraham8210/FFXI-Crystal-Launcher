@@ -95,6 +95,10 @@ pub fn start(pipe: Pipe, mut reader: LineReader) {
                         Ok(Some(proto::ServiceEvent::NativePlayPending)) => crate::native_auth::note_play_pending(),
                         Ok(Some(proto::ServiceEvent::ControllerSettings { id, settings, deadline_ms })) => crate::controller_settings::submit(id, settings, deadline_ms),
                         Ok(Some(proto::ServiceEvent::GameShutdown { id, game, deadline_ms })) => crate::game_shutdown::submit(id, game, deadline_ms),
+                        Ok(Some(proto::ServiceEvent::PadHide(entries))) => {
+                            log!("pad hotkeys: {} buttons taken from the game now", entries.len());
+                            crate::xinput_filter::set_hide(&entries);
+                        }
                         Ok(None) => {}
                         Err(e) => log!("ignoring a malformed launcher line: {e}"),
                     },

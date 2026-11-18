@@ -1,0 +1,270 @@
+// Picking accounts fast (src/selection.rs, src/slint_host/pick.rs): the header checkbox, the
+// Select menu with its saved groups, and the state the rail's paint-select shares with the host.
+import { Theme } from "theme.slint";
+import { View } from "state.slint";
+import { Glyph, Icon, Pressable, IconButton, Check } from "widgets.slint";
+
+export struct PickStrings {
+    select: string,
+    all: string,
+    none: string,
+    invert: string,
+    in-game: string,
+    signed-in: string,
+    not-signed-in: string,
+    save-as: string,
+    group-name: string,
+    save: string,
+    rename: string,
+    delete: string,
+}
+
+export global Picking {
+    in property <PickStrings> strings;
+    /// The header checkbox: 0 none picked, 1 some, 2 all.
+    in property <int> state;
+    /// The saved groups' names; the Select menu lists them after its six fixed entries.
+    in property <[string]> groups;
+    /// A paint drag is running (app.selection): the rows under the pointer take its value.
+    in property <bool> painting;
+    in-out property <bool> open;
+    /// A checkbox was pressed (row, Shift held); the pointer is over a row; the button went up.
+    callback press(int, bool);
+    callback over(int);
+    callback release();
+    /// The keyboard extends the picks from one row to another.
+    callback extend(int, int);
+    /// A Select menu entry (the six fixed ones, then the groups) and whether Ctrl added it.
+    callback pick(int, bool);
+    /// The header checkbox: all, or none when all are picked.
+    callback toggle-all();
+    callback save-group(string);
+    callback rename-group(int, string);
+    callback delete-group(int);
+}
+
+/// The rail row's checkbox: a press (not a click) starts a paint drag, and the release ends it
+/// wherever it happens. Space and Return still toggle it from the keyboard (`toggled`).
+export component PickBox inherits Check {
+    callback pressed(bool);
+    TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                View.drag-y = self.absolute-position.y + self.mouse-y;
+                root.pressed(event.modifiers.shift);
+            }
+            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up { Picking.release(); }
+        }
+        moved => { if Picking.painting { View.drag-y = self.absolute-position.y + self.mouse-y; } }
+    }
+}
+
+/// The header checkbox: none, some (a dash) or all picked.
+export component HeaderBox inherits Pressable {
+    in property <int> state;
+    width: 18px;
+    height: 18px;
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.state == 2;
+    Rectangle {
+        border-radius: Theme.radius-sm;
+        border-width: 1.5px;
+        background: root.state > 0 ? Theme.ice : transparent;
+        border-color: root.state > 0 || root.hot ? Theme.ice : Theme.line;
+        if root.state == 2: Icon {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            glyph: Glyph.check;
+            size: 12.6px;
+            weight: 2.6;
+            tint: Theme.chk;
+        }
+        if root.state == 1: Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 8px;
+            height: 2px;
+            border-radius: 1px;
+            background: Theme.chk;
+        }
+    }
+}
+
+/// A menu entry. A plain click (or Return) picks it; Ctrl-click adds it to the picks.
+component Entry inherits Pressable {
+    in property <string> text;
+    callback chosen(bool);
+    private property <bool> armed;
+    height: 30px;
+    border-radius: 4px;
+    background: area.has-hover ? Theme.tint : transparent;
+    clicked => { root.chosen(false); }
+    Text {
+        x: 10px;
+        width: parent.width - 20px;
+        text: root.text;
+        font-size: Theme.type-small;
+        color: Theme.ink;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    area := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if event.button != PointerEventButton.left { return; }
+            if event.kind == PointerEventKind.down { root.armed = true; }
+            if event.kind == PointerEventKind.up && root.armed && self.has-hover { root.chosen(event.modifiers.control); }
+            if event.kind == PointerEventKind.up { root.armed = false; }
+        }
+    }
+}
+
+/// The name of a group being saved or renamed. Return accepts, Escape cancels.
+component DraftField inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    callback accepted();
+    callback cancelled();
+    height: 28px;
+    horizontal-stretch: 1;
+    border-radius: Theme.radius-sm;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.line;
+    background: Theme.field;
+    init => { input.focus(); }
+    if root.text == "": Text {
+        x: 10px;
+        width: parent.width - 20px;
+        text: root.placeholder;
+        color: Theme.faint;
+        font-size: Theme.type-small;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    input := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        text <=> root.text;
+        single-line: true;
+        font-size: Theme.type-small;
+        color: Theme.ink;
+        vertical-alignment: center;
+        selection-background-color: Theme.accent.with-alpha(0.3);
+        selection-foreground-color: Theme.ink;
+        accessible-label: root.placeholder;
+        accepted => { root.accepted(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape { root.cancelled(); return accept; }
+            return reject;
+        }
+    }
+}
+
+/// The Select menu: All, None, Invert, the three state filters, the saved groups (a group's
+/// pencil renames it, its bin deletes it) and "Save selection as…". Placed by its owner, which
+/// sets `room`, the height it may take.
+export component SelectPanel inherits Rectangle {
+    in property <length> room;
+    /// -2 nothing is being typed, -1 a new group's name, n the name of group n.
+    private property <int> editing: -2;
+    private property <string> draft;
+    height: min(list.preferred-height + 8px, root.room);
+    background: Theme.panel;
+    border-radius: Theme.radius-inner;
+    border-width: 1px;
+    border-color: Theme.line;
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 6px;
+    drop-shadow-color: Theme.shadow;
+    init => { scope.focus(); }
+    function commit() {
+        if root.editing == -1 { Picking.save-group(root.draft); }
+        if root.editing >= 0 { Picking.rename-group(root.editing, root.draft); }
+        root.editing = -2;
+        root.draft = "";
+    }
+    function choose(entry: int, add: bool) {
+        Picking.pick(entry, add);
+        if !add { Picking.open = false; }
+    }
+    scope := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape { Picking.open = false; return accept; }
+            return reject;
+        }
+    }
+    Flickable {
+        x: 4px;
+        y: 4px;
+        width: parent.width - 8px;
+        height: parent.height - 8px;
+        content-height: list.preferred-height;
+        mouse-drag-pan-enabled: false;
+        list := VerticalLayout {
+            spacing: 0px;
+            Entry { text: Picking.strings.all; chosen(add) => { root.choose(0, add); } }
+            Entry { text: Picking.strings.none; chosen(add) => { root.choose(1, add); } }
+            Entry { text: Picking.strings.invert; chosen(add) => { root.choose(2, add); } }
+            Rectangle { height: 9px; Rectangle { y: 4px; height: 1px; background: Theme.hairline; } }
+            Entry { text: Picking.strings.in-game; chosen(add) => { root.choose(3, add); } }
+            Entry { text: Picking.strings.signed-in; chosen(add) => { root.choose(4, add); } }
+            Entry { text: Picking.strings.not-signed-in; chosen(add) => { root.choose(5, add); } }
+            if Picking.groups.length > 0: Rectangle { height: 9px; Rectangle { y: 4px; height: 1px; background: Theme.hairline; } }
+            for name[g] in Picking.groups: HorizontalLayout {
+                height: 30px;
+                spacing: 0px;
+                if root.editing == g: HorizontalLayout {
+                    spacing: 4px;
+                    padding-top: 1px;
+                    DraftField {
+                        text <=> root.draft;
+                        placeholder: Picking.strings.group-name;
+                        accepted => { root.commit(); }
+                        cancelled => { root.editing = -2; }
+                    }
+                    IconButton { cross-axis-self-alignment: center; side: 26px; glyph: Glyph.check; glyph-size: 14px; hint: Picking.strings.save; clicked => { root.commit(); } }
+                }
+                if root.editing != g: Entry {
+                    horizontal-stretch: 1;
+                    text: name;
+                    chosen(add) => { root.choose(6 + g, add); }
+                }
+                if root.editing != g: IconButton {
+                    cross-axis-self-alignment: center;
+                    side: 26px;
+                    glyph: Glyph.edit;
+                    glyph-size: 14px;
+                    hint: Picking.strings.rename;
+                    clicked => { root.draft = name; root.editing = g; }
+                }
+                if root.editing != g: IconButton {
+                    cross-axis-self-alignment: center;
+                    side: 26px;
+                    glyph: Glyph.trash;
+                    glyph-size: 14px;
+                    hint: Picking.strings.delete;
+                    clicked => { root.editing = -2; Picking.delete-group(g); }
+                }
+            }
+            Rectangle { height: 9px; Rectangle { y: 4px; height: 1px; background: Theme.hairline; } }
+            if root.editing == -1: HorizontalLayout {
+                height: 30px;
+                spacing: 4px;
+                padding-top: 1px;
+                DraftField {
+                    text <=> root.draft;
+                    placeholder: Picking.strings.group-name;
+                    accepted => { root.commit(); }
+                    cancelled => { root.editing = -2; }
+                }
+                IconButton { cross-axis-self-alignment: center; side: 26px; glyph: Glyph.check; glyph-size: 14px; hint: Picking.strings.save; clicked => { root.commit(); } }
+            }
+            if root.editing != -1: Entry {
+                text: Picking.strings.save-as;
+                chosen(add) => { root.draft = ""; root.editing = -1; }
+            }
+        }
+    }
+}

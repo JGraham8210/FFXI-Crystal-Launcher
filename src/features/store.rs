@@ -1,4 +1,4 @@
-//! The features' saved choices: `iced-launcher/features.json`, beside settings.json and kept the
+//! The features' saved choices: `Data\features.json`, beside settings.json and kept the
 //! same way (serde defaults for every field, a 1 MiB cap, atomic replacement, a damaged file
 //! preserved before it is replaced). It is a separate file so that settings.json stays exactly as
 //! older Crystals read and write it: an older Crystal ignores this file, and a newer field is
@@ -64,7 +64,7 @@ impl Default for FeatureSettings {
 const LIMIT: usize = 1024 * 1024;
 
 pub(crate) fn path(config: &Config) -> PathBuf {
-    config.experiment.join("iced-launcher/features.json")
+    config.layout().features()
 }
 
 /// The saved settings; defaults when the file is missing. `Err` for a file that exists but

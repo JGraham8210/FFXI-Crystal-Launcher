@@ -13,6 +13,8 @@ mod boot_timing;
 mod controller_catalog;
 mod controller_record;
 mod controller_settings;
+mod crash_dump;
+pub mod data_paths;
 mod disconnect;
 mod feature_check;
 mod game_modules;
@@ -34,9 +36,11 @@ mod native_handles;
 mod native_portrait;
 mod native_profile;
 mod native_social;
+pub mod pad_hide;
 mod park;
 mod pol_core;
 mod start_gate;
+mod taskbar;
 #[macro_use]
 pub mod log;
 pub mod windower_parallel;
@@ -231,6 +235,7 @@ pub fn run() -> i32 {
     startup_timing::report("log-init", log_started, log_ready);
     log!("crystal-loader {} starting{}", env!("CARGO_PKG_VERSION"), log_path.map(|p| format!(" (log {})", p.display())).unwrap_or_default());
     log!("4 GB memory: {}", if pe::this_process_large_address_aware() { "on" } else { "off (host built without /LARGEADDRESSAWARE)" });
+    crash_dump::install();
 
     let args = match args::parse(std::env::args().skip(1)) {
         Ok(a) => a,
@@ -267,6 +272,12 @@ pub fn run() -> i32 {
     }
     #[cfg(target_arch = "x86")]
     let _windower_exit_save = windower_start::ExitGuard;
+    // After the hello (Windower's injection turn is not held for it) and before anything that
+    // can create a window: Hook.dll, polcore and the game all load after the first line below.
+    match taskbar::set_app_id() {
+        Ok(()) => log!("stage: taskbar application ID {} (one group for every game host)", taskbar::APP_ID),
+        Err(e) => log!("note: taskbar application ID not set ({e}); this game's button groups by the host's path"),
+    }
     // A session and its first command can arrive in the same pipe read. Keep
     // this reader through the handoff; only consumed credential bytes are wiped.
     let mut reader = LineReader::default();
@@ -315,8 +326,10 @@ fn fail(pipe: &Pipe, code: i32, msg: String) -> i32 {
 fn log_session(session: &proto::Session) {
     // What this game's own login does, as the park line says it: a launch without
     // character select must be visible here, not only by the worker's silence.
-    log!("stage: session ok (v{}, region {}, install_dir {}, auto_login {}, dismiss_disconnect {})", proto::PROTOCOL_VERSION, session.region.name(),
-        session.install_dir.as_deref().unwrap_or("(none)"), auto_login_text(session.auto_login), session.dismiss_disconnect);
+    log!("stage: session ok (v{}, region {}, install_dir {}, auto_login {}, dismiss_disconnect {}, pad_hide {})", proto::PROTOCOL_VERSION, session.region.name(),
+        session.install_dir.as_deref().unwrap_or("(none)"), auto_login_text(session.auto_login), session.dismiss_disconnect, session.pad_hide.len());
+    // Before the game reads the pad: the buttons Crystal's pad hotkeys take.
+    xinput_filter::set_hide(&session.pad_hide);
 }
 
 fn auto_login_text(auto_login: proto::AutoLogin) -> String {
@@ -418,7 +431,7 @@ fn game_failed(pipe: &Pipe, error: String) -> i32 {
 fn finish(result: GameResult) -> i32 {
     let code = match result {
         Ok(outcome) => {
-            log!("stage: game exited with code {}{}", outcome.code, if outcome.message.is_empty() { String::new() } else { format!(": {}", outcome.message) });
+            key_log!("stage: game exited with code {}{}", outcome.code, if outcome.message.is_empty() { String::new() } else { format!(": {}", outcome.message) });
             if outcome.code != 0 && !outcome.message.is_empty() {
                 events::send(proto::error_line(&outcome.message));
             }

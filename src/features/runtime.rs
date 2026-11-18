@@ -15,6 +15,7 @@
 
 use super::game_window::{self, Monitor};
 use super::hotkeys::{self, Action, Hotkey, Problem};
+use super::padchord::{self, PadChord};
 use super::layouts;
 use super::recovery::{self, Decision, EndKind};
 use super::{backups, desktop, discord, keyhook, notify, perf, playtime, store, ClientKey, FeatureSettings};
@@ -43,6 +44,9 @@ pub(crate) enum Event {
     RelaunchDue(String),
     /// Something a feature could not do (saving its settings, applying priority).
     Error(String),
+    /// The controller buttons every game hides changed (`padchord::hide_list`): running games
+    /// hear it at once, and every launch carries it.
+    PadHide(Vec<[u32; 2]>),
 }
 
 pub(crate) type Sink = Arc<dyn Fn(Event) + Send + Sync>;
@@ -102,6 +106,9 @@ struct Inner {
     /// What each registered hotkey id does.
     hotkeys: Vec<(i32, Action, Hotkey)>,
     hotkey_status: Vec<hotkeys::Status>,
+    /// What each controller hotkey id does, and the refused ones (`padchord::plan`).
+    pad_hotkeys: Vec<(i32, Action, PadChord)>,
+    pad_refused: Vec<padchord::Refused>,
     recovery: recovery::Policy,
     wake_generation: u64,
     playtime: playtime::Tracker,
@@ -176,6 +183,8 @@ impl Runtime {
                     desktop: None,
                     hotkeys: Vec::new(),
                     hotkey_status: Vec::new(),
+                    pad_hotkeys: Vec::new(),
+                    pad_refused: Vec::new(),
                     recovery: recovery::Policy::default(),
                     wake_generation: 0,
                     notify,
@@ -311,7 +320,7 @@ impl Runtime {
             let Some(game) = inner.games.remove(&end.account) else { return Decision::None };
             inner.playtime.stop(&game.key, now_unix());
             self.changed();
-            let clean = end.user_closed || end.report.as_ref().is_some_and(|r| r.kind == crate::launch_log::ExitKind::Normal);
+            let clean = end.user_closed || end.report.as_ref().is_some_and(|r| !r.is_problem());
             let wer = !clean && recovery::wer_report_since("pol.exe", game.started_wall);
             let kind = recovery::classify(end.report.as_ref(), end.user_closed, wer);
             let during_startup = end.report.as_ref().is_some_and(|r| r.during_startup);
@@ -390,9 +399,22 @@ impl Runtime {
     /// is armed by the foreground changes of the watched games.
     fn refresh_desktop(&self) {
         let (plan, refused) = hotkeys::plan(&self.inner().settings.hotkeys);
+        let (pads, pad_refused) = padchord::plan(&self.inner().settings.hotkeys);
         let mut report: Option<Vec<hotkeys::Status>> = None;
+        let mut hide: Option<Vec<[u32; 2]>> = None;
         let (track, dropped) = {
             let mut inner = self.inner();
+            // The controller hotkeys: in-game only, so the thread they need runs while games do.
+            let pads_changed = inner.pad_hotkeys != pads;
+            if pads_changed || inner.pad_refused != pad_refused {
+                let before = padchord::hide_list(&inner.pad_hotkeys);
+                let now = padchord::hide_list(&pads);
+                if before != now { hide = Some(now); }
+                inner.pad_hotkeys = pads.clone();
+                inner.pad_refused = pad_refused;
+                self.changed();
+            }
+            let send_pads = pads_changed || inner.desktop.is_none();
             // Every running game is watched: its window is found, remembered, restored and
             // marked for the taskbar when it covers its monitor.
             let track: Vec<u32> = inner.games.values().flat_map(|g| g.pids.iter().copied()).collect();
@@ -426,6 +448,9 @@ impl Runtime {
                 } else if changed {
                     if let Some(d) = &inner.desktop { send_hotkeys(d, &plan); }
                 }
+                if send_pads {
+                    if let Some(d) = &inner.desktop { d.send(desktop::Command::PadHotkeys(pads.iter().map(|(id, _, c)| (*id, *c)).collect())); }
+                }
                 // The thread reports what registering returned.
                 report = None;
                 (Some(track), None)
@@ -437,16 +462,27 @@ impl Runtime {
             if let Some(d) = &self.inner().desktop { d.send(desktop::Command::Track(track)); }
         }
         if let Some(statuses) = report { self.emit(Event::Hotkeys(statuses)); }
+        if let Some(list) = hide { self.emit(Event::PadHide(list)); }
     }
 
     /// Every configured hotkey and its state (after the last registration).
     pub(crate) fn hotkey_status(&self) -> Vec<hotkeys::Status> { self.inner().hotkey_status.clone() }
 
+    /// The controller hotkeys that can't act, and why.
+    pub(crate) fn pad_refused(&self) -> Vec<padchord::Refused> { self.inner().pad_refused.clone() }
+
+    /// What every game hides for the controller hotkeys now (`pad_hide`).
+    pub(crate) fn pad_hide(&self) -> Vec<[u32; 2]> { padchord::hide_list(&self.inner().pad_hotkeys) }
+
     /// Handled on the desktop thread.
     fn on_desktop(&self, event: desktop::Event) {
         match event {
             desktop::Event::Hotkey { id, via, key } => {
-                let action = self.inner().hotkeys.iter().find(|(i, _, _)| *i == id).map(|(_, a, _)| a.clone());
+                let action = if via == desktop::Via::Pad {
+                    self.inner().pad_hotkeys.iter().find(|(i, _, _)| *i == id).map(|(_, a, _)| a.clone())
+                } else {
+                    self.inner().hotkeys.iter().find(|(i, _, _)| *i == id).map(|(_, a, _)| a.clone())
+                };
                 match action {
                     Some(action) => self.run_action(&action, via, key),
                     None => self.diag(&format!("hotkeys: {} id {id}: no hotkey has this id", via.name())),
@@ -1156,7 +1192,31 @@ mod tests {
         runtime.update(|s| s.hotkeys.accounts.clear()).unwrap();
         assert!(runtime.inner().desktop.is_none());
         // The change was saved where the next start reads it.
-        assert!(dir.join("iced-launcher/features.json").is_file());
+        assert!(crate::storage::Layout::at(&dir).features().is_file());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Controller hotkeys are in-game only: no thread of their own until a game runs. Their
+    /// buttons go to every launch and, when they change, to the running games.
+    #[test]
+    fn pad_hotkeys_wait_for_a_game_and_their_buttons_reach_the_games() {
+        use crate::gamepad::detect::Btn;
+        let (runtime, dir, events) = runtime();
+        let chord = |text: &str| padchord::PadChord::parse(text).unwrap();
+        runtime.update(|s| { s.hotkeys.pad_cycle = Some(chord("Guide")); s.hotkeys.pad_accounts.insert("a".into(), chord("LT+Back")); }).unwrap();
+        assert!(runtime.inner().desktop.is_none(), "no game: nothing reads the pads");
+        assert_eq!(runtime.pad_hide(), [[0, 0x400], [1 << 16, 0x20]]);
+        let pushed = |events: &Arc<Mutex<Vec<Event>>>| events.lock().unwrap().iter().filter_map(|e| if let Event::PadHide(l) = e { Some(l.clone()) } else { None }).collect::<Vec<_>>();
+        assert_eq!(pushed(&events), [vec![[0, 0x400], [1 << 16, 0x20]]]);
+        // The same list again (a refused chord added): no push.
+        runtime.update(|s| { s.hotkeys.pad_cycle_back = Some(chord("Guide")); }).unwrap();
+        assert_eq!(pushed(&events).len(), 1);
+        assert_eq!(runtime.pad_refused().iter().map(|r| (r.action.clone(), r.problem)).collect::<Vec<_>>(), [(Action::Previous, Problem::Duplicate)]);
+        // A pad id names the pad hotkey's action, not a keyboard one.
+        let id = runtime.inner().pad_hotkeys.iter().find(|(_, a, _)| *a == Action::Account("a".into())).map(|(id, _, _)| *id).unwrap();
+        assert!(id >= padchord::FIRST_ID && padchord::PadChord::single(Btn::Guide) == runtime.inner().pad_hotkeys[0].2);
+        runtime.update(|s| { s.hotkeys.pad_cycle = None; s.hotkeys.pad_cycle_back = None; s.hotkeys.pad_accounts.clear(); }).unwrap();
+        assert_eq!(pushed(&events).last(), Some(&vec![]), "cleared: the games hide nothing");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1213,7 +1273,7 @@ mod tests {
             .stdout(std::process::Stdio::null()).spawn().unwrap();
         runtime.game_started(GameStart { account: "acct".into(), slot: Some(2), label: "Main".into(), pid: child.id() });
         assert!(runtime.inner().desktop.is_some(), "remember/restore are on by default: the game is watched");
-        let report = ExitReport { kind: crate::launch_log::ExitKind::Code { code: 3 }, exit_status: Some(3), during_startup: false, summary: String::new() };
+        let report = ExitReport { kind: crate::launch_log::ExitKind::Code { code: 3 }, exit_status: Some(3), during_startup: false, crash_dump: false, summary: String::new() };
         let decision = runtime.game_ended(GameEnd { account: "acct".into(), report: Some(report), user_closed: false, maintenance: false });
         let _ = child.kill();
         let _ = child.wait();
@@ -1275,7 +1335,7 @@ mod tests {
         let (runtime, dir, _) = runtime();
         runtime.update(|s| { s.recovery.auto_relaunch = true; s.layouts.remember = false; s.layouts.restore = false; }).unwrap();
         runtime.game_started(GameStart { account: "a".into(), slot: None, label: String::new(), pid: std::process::id() });
-        let crash = ExitReport { kind: crate::launch_log::ExitKind::Other, exit_status: Some(0xC000_0005u32 as i32), during_startup: false, summary: String::new() };
+        let crash = ExitReport { kind: crate::launch_log::ExitKind::Other, exit_status: Some(0xC000_0005u32 as i32), during_startup: false, crash_dump: false, summary: String::new() };
         let decision = runtime.game_ended(GameEnd { account: "a".into(), report: Some(crash), user_closed: false, maintenance: false });
         assert!(matches!(decision, Decision::Relaunch { kind: EndKind::Crash, attempt: 1, .. }), "{decision:?}");
         assert!(runtime.pending_relaunch("a").is_some());

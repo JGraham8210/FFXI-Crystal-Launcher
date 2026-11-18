@@ -258,6 +258,8 @@ export struct Sheet {
     delete-enabled: bool,
     save-label: string,
     save-enabled: bool,
+    merge-label: string,
+    can-merge: bool,
     /// A saved retail account: its PlayOnline portrait row (the picture once a session reported
     /// it, the silhouette in privacy mode) and the picker button.
     portrait-shown: bool,
@@ -386,6 +388,7 @@ export global View {
     in-out property <string> sheet-folder;
     callback close-sheet();
     callback save-sheet();
+    callback merge-sheet();
     /// A field changed: 0 label, 1 server, 2 PlayOnline ID, 3 password, 4 Square Enix ID,
     /// 5 Square Enix password, 6 handle names, 7 authenticator key (crate::Field's order).
     callback sheet-edited(int, string);

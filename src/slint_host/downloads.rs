@@ -250,8 +250,13 @@ fn installation(dl: &Downloads, app: &App, state: &mut State, private: &Private)
         _ if app.patch_loading => (Glyph::Refresh, Ink::Sub, t("Checking version…")),
         _ => (Glyph::AlertCircle, Ink::Sub, t("Not checked")),
     };
+    // As for FFXI: with no check this session, judge against the last real check.
+    let viewer_matched = app.viewer.as_ref().filter(|v| v.version.state == PatchState::Unknown)
+        .and_then(|v| crate::official_versions::compare(&v.version.local_version, app.official.playonline()))
+        == Some(std::cmp::Ordering::Equal);
     let (viewer_installed, viewer_detail) =
-        app.viewer.as_ref().map(|v| (v.version.local_version.as_str(), v.version.detail.as_str())).unwrap_or((t("Not checked"), ""));
+        app.viewer.as_ref().map(|v| (v.version.local_version.as_str(), if viewer_matched { "" } else { v.version.detail.as_str() }))
+            .unwrap_or((t("Not checked"), ""));
     let viewer_latest = crate::official_versions::latest_playonline_text(app);
     // Each state has its glyph, as the FFXI status beside it does, so both lines share one text edge.
     let (viewer_state_glyph, viewer_state_ink, viewer_state) = if app.viewer_loading {
@@ -260,6 +265,8 @@ fn installation(dl: &Downloads, app: &App, state: &mut State, private: &Private)
         (Glyph::AlertCircle, Ink::Accent, t("Needs attention"))
     } else if app.viewer.as_ref().is_some_and(|v| v.version.state == PatchState::Current) {
         (Glyph::CheckCircle, Ink::Ok, t("Up to date"))
+    } else if viewer_matched {
+        (Glyph::CheckCircle, Ink::Ok, t("Matched at last check"))
     } else {
         (Glyph::AlertCircle, Ink::Sub, t("Not verified"))
     };

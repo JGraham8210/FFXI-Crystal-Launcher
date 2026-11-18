@@ -52,22 +52,22 @@ enum Access {
 
 /// Hold from before reading the profile until Windower.exe has exited and saved.
 pub(super) fn launching(folder: &Path, progress: &mut dyn FnMut(&str)) -> Result<Guard, String> {
-    acquire(&super::tools::embedded::data_dir(), folder, Access::Launch, WAIT_LIMIT, progress)
+    acquire(&crate::storage::Layout::current().locks(), folder, Access::Launch, WAIT_LIMIT, progress)
 }
 
 /// Hold through the editor child's exit. An already-running game is independent
 /// of this guard; a launcher still preparing a game may have a pending XML save.
 pub(crate) fn editing(folder: &Path, progress: &mut dyn FnMut(&str)) -> Result<Guard, String> {
-    acquire(&super::tools::embedded::data_dir(), folder, Access::Edit, WAIT_LIMIT, progress)
+    acquire(&crate::storage::Layout::current().locks(), folder, Access::Edit, WAIT_LIMIT, progress)
 }
 
-fn lock_path(root: &Path, folder: &Path) -> Result<PathBuf, String> {
+fn lock_path(locks: &Path, folder: &Path) -> Result<PathBuf, String> {
     let folder = fs::canonicalize(folder)
         .map(|path| crate::backend::plain_windows_path(&path))
         .map_err(|_| t("Could not resolve the Windower profile folder."))?;
     let identity = folder.to_string_lossy().replace('/', "\\").to_lowercase();
     let hash = super::tools::embedded::sha256_hex(identity.as_bytes());
-    Ok(root.join("locks").join(format!("windower-profile-{hash}.lock")))
+    Ok(locks.join(format!("windower-profile-{hash}.lock")))
 }
 
 fn open(path: &Path, access: Access) -> io::Result<File> {

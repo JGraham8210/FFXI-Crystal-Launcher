@@ -14,6 +14,13 @@ fn japanese_text_wraps_by_em_width_inside_the_card() {
     assert!(text_em("ああ") > text_em("aa") * 1.5);
 }
 
+/// A game on its fatal network dialog lights the error lamp, in the danger ink.
+#[test]
+fn connection_lost_shows_as_an_error() {
+    assert!(matches!(row_lamp(RowState::ConnectionLost), LampState::Error));
+    assert!(matches!(row_ink(RowState::ConnectionLost), Ink::Danger));
+}
+
 #[test]
 fn short_titles_stay_whole_and_long_ones_end_in_an_ellipsis() {
     let whole = wrap_lines("Free Trial Level Cap Raised to Level 75 and Time Limit Removed", 280.0, 16.0, 3);

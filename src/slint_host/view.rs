@@ -207,6 +207,7 @@ pub(super) fn wire(ui: &MainWindow) {
     // ---- account sheet ----
     view.on_close_sheet(|| send(Message::CloseEditor));
     view.on_save_sheet(|| send(Message::SaveAccount));
+    view.on_merge_sheet(|| send(Message::MergeAccount));
     view.on_sheet_edited(|i, value| { if let Some(field) = index(i).and_then(|i| FIELDS.get(i)) { send(Message::EditorChanged(*field, value.into())); } });
     view.on_sheet_folder_edited(|value| send(Message::AccountInstallChanged(value.into())));
     view.on_sheet_region(|i| { if (0..3).contains(&i) { send(Message::EditorRegion(i as u8)); } });
@@ -815,7 +816,7 @@ fn row_ink(state: RowState) -> Ink {
         RowState::Playing => Ink::Info,
         RowState::SignedIn => Ink::Ok,
         RowState::Private | RowState::Idle => Ink::Sub,
-        RowState::NeedsCode | RowState::Problem => Ink::Danger,
+        RowState::NeedsCode | RowState::Problem | RowState::ConnectionLost => Ink::Danger,
     }
 }
 
@@ -827,7 +828,7 @@ fn row_lamp(state: RowState) -> LampState {
         RowState::SignedIn => LampState::Ready,
         RowState::Starting | RowState::SigningIn | RowState::Updating | RowState::ViewerUpdating => LampState::Rising,
         RowState::NeedsCode | RowState::ViewerConfirm => LampState::Code,
-        RowState::Problem => LampState::Error,
+        RowState::Problem | RowState::ConnectionLost => LampState::Error,
         RowState::Closing | RowState::Waiting | RowState::Private | RowState::Relaunching | RowState::Idle => LampState::Off,
     }
 }
@@ -1075,7 +1076,7 @@ fn footer(view: &View, app: &App, state: &mut State) {
         shutdown: can_shutdown || shutdown_pending,
         shutdown_busy: busy,
         shutdown_enabled: can_shutdown,
-        shutdown_label: (if busy { t("Shutting down…") } else { t("Shut down selected") }).into(),
+        shutdown_label: crate::selection::shutdown_label(busy, app.shutdown_count(true)).into(),
         launch_current: launcher.and_then(|tool| LaunchWith::ALL.iter().position(|t| *t == tool)).map_or(-1, |i| i as i32),
         play_label: label.into(),
         play_glyph: glyph,
@@ -1306,6 +1307,8 @@ fn sheet(view: &View, app: &App, state: &mut State) {
         delete_enabled: !active && !app.vault_saving,
         save_label: (if editing { t("Save") } else { t("Add account") }).into(),
         save_enabled: !app.vault_saving,
+        merge_label: t("Update existing account").into(),
+        can_merge: app.merge_target(editor).is_some(),
     };
     put!(view, get_sheet, set_sheet, sheet);
     put!(view, get_sheet_label, set_sheet_label, account.label.as_str().into());

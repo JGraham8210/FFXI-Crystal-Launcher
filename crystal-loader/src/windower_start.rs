@@ -147,10 +147,7 @@ fn windower_parent() -> Result<Option<OwnedHandle>, String> {
 
 fn turn_path() -> Result<PathBuf, String> {
     // Same path as session_worker::windower_lock_path, including isolated test roots.
-    let root = std::env::var_os("CRYSTAL_DATA_ROOT")
-        .or_else(|| std::env::var_os("LOCALAPPDATA"))
-        .ok_or("Could not locate the Windower launch lock directory.")?;
-    Ok(PathBuf::from(root).join("Crystal Launcher/locks/windower.lock"))
+    Ok(crate::data_paths::locks().join("windower.lock"))
 }
 
 fn open_turn(path: &Path) -> io::Result<File> {

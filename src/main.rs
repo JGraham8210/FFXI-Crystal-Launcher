@@ -14,6 +14,7 @@ mod b64;
 mod wire;
 mod account_import_ui;
 mod account_order;
+mod selection;
 mod account_row;
 mod discovery;
 mod dns;
@@ -33,6 +34,9 @@ mod gamepad;
 mod i18n;
 mod installer;
 mod launch_log;
+mod game_log;
+mod host_exit;
+mod log_export;
 mod launch_timing;
 mod launch_tools;
 mod open_with_game;
@@ -72,6 +76,10 @@ mod host;
 mod instance;
 mod settings;
 mod shell;
+mod shutdown_row;
+mod storage;
+/// The game host's name for the shared data-folder names (`controller_record` uses it).
+use storage::names as data_paths;
 
 use backend::{account_key, Account, AccountMode, Config, LaunchResult};
 use i18n::{t, tf};
@@ -176,6 +184,8 @@ pub(crate) struct AccountRow {
     pub shutting_down: bool,
     /// How the shut-down in flight (`shutting_down`) ends the game.
     shutdown_mode: session_worker::game_shutdown::Mode,
+    /// Shut down's lasting state: the user's close, Close now, Connection lost.
+    closing: shutdown_row::Closing,
     /// Background sign-in can accept Play without starting another login.
     preparing_session: bool,
     /// The current sign-in thread's completion flag, set just before its Complete is sent:
@@ -678,7 +688,9 @@ pub(crate) enum Message {
     ShutdownAccount(String),
     ShutdownSelected,
     ShutdownAll,
-    GameShutdownFinished(String, u64, Result<(), String>),
+    /// A row's Close now: the instant path for a game a graceful shut-down left open.
+    CloseNow(String),
+    GameShutdownFinished(String, u64, Result<(), session_worker::game_shutdown::Refusal>),
     AccountSignOut(String),
     AccountSignedOut(String, u64, Result<(), String>),
     FriendsStatus(session_worker::NativeControl),
@@ -704,6 +716,7 @@ pub(crate) enum Message {
     FriendsDraftClose,
     ToggleDetails,
     ToggleAccount(String, bool),
+    Selection(selection::Command),
     AccountDragStart(String),
     AccountDragOver(String),
     AccountDragFinish,
@@ -731,6 +744,8 @@ pub(crate) enum Message {
     EditorBootIni(Option<String>),
     EditorProfile(Option<String>),
     SaveAccount,
+    /// A new account whose login is already saved: fill that account's empty fields instead.
+    MergeAccount,
     RequestDeleteAccount(String),
     CancelDeleteAccount,
     DeleteAccount(String),
@@ -823,6 +838,8 @@ pub(crate) enum Message {
     OpenWithGameDone(open_with_game::Report),
     Dgvoodoo(dgvoodoo::Msg),
     Reshade(reshade::Msg),
+    /// Settings → System → Logs (`log_export`).
+    Logs(log_export::Msg),
 }
 /// A path field that has a native Browse dialog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -854,6 +871,7 @@ pub(crate) struct App {
     pub show_details: bool,
     pub accounts: Vec<AccountRow>,
     pub account_drag: account_order::Drag,
+    pub selection: selection::State,
     pub editor: Option<Editor>,
     pub account_import: account_import_ui::State,
     pub services: Option<services::ServiceSnapshot>,
@@ -1052,6 +1070,7 @@ impl App {
             show_details: false,
             accounts: Vec::new(),
             account_drag: account_order::Drag::default(),
+            selection: selection::State::default(),
             windower_editor_open: false,
             editor: None,
             account_import: account_import_ui::State::default(),
@@ -1247,7 +1266,8 @@ impl App {
             tick,
             // The controller thread polls only while there is a window to drive.
             gamepad: self.window.is_some(),
-            account_drag: self.account_drag.source.is_some(),
+            // Pointer input goes to a reorder or to a paint drag (`selection`): a release ends it.
+            account_drag: self.account_drag.source.is_some() || self.selection.painting(),
             controller_repeat: self.controller_nav.repeating(),
         }
     }
@@ -1799,6 +1819,7 @@ impl App {
     }
 
     fn cancel_account_drag(&mut self) {
+        self.cancel_paint();
         let drag = std::mem::take(&mut self.account_drag);
         if drag.source.is_some() {
             account_order::apply(&mut self.accounts, &drag.original, |row| row.key.as_str());
@@ -1806,6 +1827,7 @@ impl App {
     }
 
     fn finish_account_drag(&mut self) {
+        self.finish_paint();
         let drag = std::mem::take(&mut self.account_drag);
         if drag.source.is_none() { return; }
         let order: Vec<_> = self.accounts.iter().map(|row| row.key.clone()).collect();
@@ -1859,6 +1881,7 @@ impl App {
                     signing_out: false,
                     shutting_down: false,
                     shutdown_mode: session_worker::game_shutdown::Mode::Graceful,
+                    closing: Default::default(),
                     preparing_session: false,
                     sign_in_done: None,
                     queued_play: None,
@@ -2037,9 +2060,10 @@ impl App {
         let mut jobs = Vec::new();
         let mut generations = HashMap::new();
         for (key, session) in keys {
+            let number = account_number(&self.accounts, &key);
             let Some(row) = self.accounts.iter_mut().find(|row| row.key == key
                 && (row.can_play() || row.queued_signin_play() && row.queued_play == Some(clicked))) else { continue; };
-            let Some(mut via) = play_plan(&self.launch_tools, &self.settings, &self.features, &row.account) else { continue; };
+            let Some(mut via) = play_plan(&self.launch_tools, &self.settings, &self.features, &row.account, number) else { continue; };
             via.trigger = trigger;
             row.launch_trigger = Some(trigger);
             row.network_wait = None;
@@ -3133,6 +3157,7 @@ impl App {
         // Ashita/Windower start inside each worker waits its turn (pol_less::TurnGate: the
         // machine-wide windower.lock and ashita.lock in session_worker).
         for key in keys {
+            let number = account_number(&self.accounts, &key);
             let Some(row) = self
                 .accounts
                 .iter_mut()
@@ -3242,7 +3267,7 @@ impl App {
             }
             // the account's own launcher, boot config and profile,
             // over the Launch tools defaults. All retail routes use the same session worker.
-            let mut via = play_plan(&self.launch_tools, &self.settings, &self.features, &account);
+            let mut via = play_plan(&self.launch_tools, &self.settings, &self.features, &account, number);
             let trigger = trigger.unwrap_or(if social_only { LaunchTrigger::Connect } else { LaunchTrigger::Play });
             // Named before a parked host renames it (ParkedConnect).
             let presign_login = social_only && trigger.is_presign();
@@ -3485,7 +3510,8 @@ impl App {
             .filter(|row| row.account.mode == AccountMode::Retail && row.account.region == 0 && !row.signed_out && !self.presign_coming(row)
                 && row.pid.is_none() && !row.busy && row.can_play())
             .filter_map(|row| {
-                let plan = self.launch_tools.launch_plan(&self.settings, &row.account)?;
+                let mut plan = self.launch_tools.launch_plan(&self.settings, &row.account)?;
+                plan.account_number = account_number(&self.accounts, &row.key);
                 Some((row.key.clone(), pol_less::park::ParkKey::for_plan(&row.account, &plan), plan))
             })
             .collect()
@@ -3605,7 +3631,7 @@ impl App {
             }
             return;
         }
-        let clean = matches!(kind, Some(ExitKind::Normal | ExitKind::Code { code: -14 }));
+        let clean = matches!(kind, Some(ExitKind::Normal | ExitKind::Ended | ExitKind::Code { code: -14 }));
         // A startup sign-in still waiting for this session (Crystal opened during the game)
         // becomes this delayed sign-in after the game, not an immediate startup sign-in.
         self.startup_waiting.retain(|(waiting, _)| waiting != key);
@@ -3824,8 +3850,12 @@ impl App {
 
     /// Ends one account's game (only), the checked accounts' games, or every running game.
     fn shutdown_games(&mut self, selected: bool, only: Option<&str>) -> Effect<Message> {
-        if self.closing { return Effect::none(); }
         let mode = session_worker::game_shutdown::Mode::from_setting(self.settings.close_games_instantly);
+        self.shutdown_games_with(selected, only, mode)
+    }
+
+    fn shutdown_games_with(&mut self, selected: bool, only: Option<&str>, mode: session_worker::game_shutdown::Mode) -> Effect<Message> {
+        if self.closing { return Effect::none(); }
         let mut tasks = Vec::new();
         for row in &mut self.accounts {
             if (selected && !row.selected) || only.is_some_and(|key| row.key != key) || !row.can_shut_down() { continue; }
@@ -3841,6 +3871,7 @@ impl App {
             row.network_wait = None;
             row.shutting_down = true;
             row.shutdown_mode = mode;
+            (row.closing.used, row.closing.close_now) = (true, false);
             row.problem = false;
             row.status = row.status_text().into_owned();
             if self.preview {
@@ -3972,7 +4003,7 @@ impl App {
     /// Register (`Some(true)`) or remove the Start with Windows task off the UI thread, or
     /// (`None`, at start with the switch on) check it still starts this exe.
     fn startup_task(&self, on: Option<bool>) -> Effect<Message> {
-        let scratch = self.config.experiment.join("iced-launcher");
+        let scratch = self.config.layout().data();
         Effect::perform(async move {
             tokio::task::spawn_blocking(move || {
                 let exe = std::env::current_exe().map_err(|_| t("Could not locate Crystal's program file.").to_owned())?;
@@ -4053,7 +4084,7 @@ impl App {
     fn watched_flags(&self) -> Vec<(Arc<AtomicBool>, bool)> {
         let mut flags = Vec::new();
         for row in &self.accounts {
-            for flag in [&row.alive, &row.game_running].into_iter().flatten() {
+            for flag in [&row.alive, &row.game_running, &row.closing.connection_lost].into_iter().flatten() {
                 flags.push((flag.clone(), flag.load(Ordering::Acquire)));
             }
         }
@@ -4131,7 +4162,7 @@ impl App {
         let Some(row) = self.accounts.iter().find(|r| r.key == key) else {
             return;
         };
-        let logs = self.config.logs_directory(&row.account);
+        let logs = self.config.game_logs_directory();
         let target = if folder { Some(logs.clone()) } else { row.log.clone() };
         let opened = match target {
             Some(target) => open_log_path(&logs, &target),
@@ -4319,7 +4350,7 @@ impl App {
                         timing.mark(launch_timing::Milestone::GameStarted);
                         row.timing = timing.row_summary();
                         row.status = t("Client started · continue in game").into();
-                        if let Some(log) = &row.log { timing.append_to(&launch_timing::sibling_path(log)); }
+                        if let Some(log) = &row.log { timing.append_to(log); }
                     }
                 }
                 if row.busy && row.is_playing() && !row.batch_pending { row.busy = false; }
@@ -4344,7 +4375,8 @@ impl App {
                     .outcome
                     .take()
                     .and_then(|slot| slot.lock().ok().and_then(|mut r| r.take()));
-                if row.game_seen { ended.push((row.key.clone(), report.clone(), row.shutting_down || row.signing_out)); }
+                let user_closed = row.shutting_down || row.signing_out || row.closing.used;
+                if row.game_seen { ended.push((row.key.clone(), report.clone(), user_closed)); }
                 if row.game_seen && !self.settings.sign_in_after_game { row.signed_out = true; }
                 if std::mem::take(&mut row.game_seen) && !std::mem::take(&mut row.resign_declined) {
                     game_ends.push((row.key.clone(), report.as_ref().map(|r| r.kind.clone()), host));
@@ -4357,6 +4389,9 @@ impl App {
                         row.status = t("Client closed").into();
                     }
                 }
+                // Shut down's end reads "FFXI closed.", whatever the report says.
+                let report = row.exit.clone();
+                row.shutdown_end(report.as_ref());
             }
         }
         self.features_observed(started, ended);
@@ -4514,6 +4549,7 @@ impl App {
                             row.pid = Some(result.pid);
                             row.alive = Some(result.alive);
                             row.game_running = Some(result.game_running);
+                            row.closing.connection_lost = Some(result.connection_lost);
                             // A batch reports each prepared account Ready, then Failed for all
                             // when the batch failed (session_batch::coordinate), such as for an
                             // update its W20 asked for: what started it classifies that failure
@@ -4716,7 +4752,7 @@ impl App {
 
     fn poll_controller(&mut self, capturing: bool) {
         let allowed = self.settings.controller_navigation && window_chrome::is_foreground()
-            && !capturing && !self.gamepad.capturing() && !matches!(self.self_update, self_update::State::Applying);
+            && !capturing && !self.gamepad.capturing() && !gamepad::padswitch::recording() && !matches!(self.self_update, self_update::State::Applying);
         if self.controller_nav.poll(self.gamepad.controller_pad(), allowed, Instant::now())
             && activity_due(&mut LAST_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()), Instant::now()) {
             let _ = self.update(Message::UserInput);
@@ -4928,7 +4964,7 @@ impl App {
                 }
             }
             Message::ControllerBack => {
-                if self.account_drag.source.is_some() { self.cancel_account_drag(); return Effect::none(); }
+                if self.account_drag.source.is_some() || self.selection.painting() { self.cancel_account_drag(); return Effect::none(); }
                 if self.gamepad.capturing() { return self.update(Message::Gamepad(gamepad::Msg::CancelCapture)); }
                 if self.confirm_close { return self.update(Message::CancelClose); }
                 if self.pending_delete.is_some() { return self.update(Message::CancelDeleteAccount); }
@@ -5027,24 +5063,10 @@ impl App {
             Message::ShutdownAccount(key) => return self.shutdown_games(false, Some(&key)),
             Message::ShutdownSelected => return self.shutdown_games(true, None),
             Message::ShutdownAll => return self.shutdown_games(false, None),
+            Message::CloseNow(key) => return self.shutdown_games_with(false, Some(&key), session_worker::game_shutdown::Mode::Instant),
             Message::GameShutdownFinished(key, generation, result) => {
                 if let Some(row) = self.accounts.iter_mut().find(|row| row.key == key && row.launch_generation == generation) {
-                    row.shutting_down = false;
-                    if let Err(error) = result {
-                        row.problem = true;
-                        row.status = error;
-                    } else if row.game_seen {
-                        row.problem = false;
-                        row.status = if self.settings.sign_in_after_game {
-                            t("FFXI closed. Returning to PlayOnline…")
-                        } else { t("FFXI and PlayOnline closed.") }.into();
-                        // The monitor publishes the exit report before `alive = false`.
-                        // Let Tick consume both, whether it runs before or after this result,
-                        // so automatic sign-in is scheduled once with the actual exit reason.
-                        if self.preview {
-                            row.alive = Some(Arc::new(AtomicBool::new(false)));
-                        }
-                    }
+                    row.shutdown_finished(result, self.settings.sign_in_after_game, self.preview);
                 }
             }
             Message::AccountSignOut(key) => return self.sign_out_account(key),
@@ -5058,6 +5080,7 @@ impl App {
                         row.pid = None;
                         row.alive = None;
                         row.game_running = None;
+                        row.closing.connection_lost = None;
                         row.outcome = None;
                         row.exit = None;
                         row.timing.clear();
@@ -5119,6 +5142,7 @@ impl App {
             Message::Prereqs(m) => return prereqs::update(&mut self.prereqs, m).map(Message::Prereqs),
             Message::Dgvoodoo(m) => return dgvoodoo::update(self, m),
             Message::Reshade(m) => return reshade::update(self, m),
+            Message::Logs(m) => return log_export::update(self, m),
             Message::Gamepad(m) => {
                 let captured = self.gamepad.capturing();
                 let task = gamepad::update(&mut self.gamepad, m, &self.config).map(Message::Gamepad);
@@ -5287,19 +5311,8 @@ impl App {
             }
             Message::AccountDragFinish => self.finish_account_drag(),
             Message::AccountDragCancel => self.cancel_account_drag(),
-            Message::ToggleAccount(key, value) => {
-                if let Some(row) = self.accounts.iter_mut().find(|r| r.key == key) {
-                    row.selected = value;
-                }
-                self.settings.selected_accounts = Some(
-                    self.accounts
-                        .iter()
-                        .filter(|r| r.selected)
-                        .map(|r| r.key.clone())
-                        .collect(),
-                );
-                self.persist_settings();
-            }
+            Message::ToggleAccount(key, value) => self.toggle_account(key, value),
+            Message::Selection(command) => self.selection_command(command),
             Message::WindowResized(size) => {
                 self.viewport = size;
                 // Maximise/restore arrives as a resize; keep the chrome's
@@ -5514,6 +5527,7 @@ impl App {
                     return self.save_accounts(values);
                 }
             }
+            Message::MergeAccount => return self.merge_account(),
             Message::RequestDeleteAccount(key) => {
                 if self.vault_ready && !self.vault_saving && self.accounts.iter().any(|row| row.key == key && !row.busy && row.pid.is_none()) {
                     self.pending_delete = Some(key);
@@ -5882,8 +5896,9 @@ impl App {
                                     settings.account_auto_login.insert(key.clone(), choice);
                                 }
                                 if let Some(selected) = &mut settings.selected_accounts {
-                                    if selected.remove(previous) { selected.insert(key); }
+                                    if selected.remove(previous) { selected.insert(key.clone()); }
                                 }
+                                selection::rename_key(&mut settings.account_groups, previous, &key);
                                 for ordered in &mut settings.account_order {
                                     if ordered == previous { *ordered = account_key(&editor.account); }
                                 }
@@ -5898,6 +5913,7 @@ impl App {
                         settings.account_no_otp.retain(|key| saved.contains(key));
                         settings.account_order.retain(|key| saved.contains(key));
                         if let Some(selected) = &mut settings.selected_accounts { selected.retain(|key| saved.contains(key)); }
+                        selection::prune(&mut settings.account_groups, &saved);
                         if self.play_updates.viewer_confirm.as_ref().is_some_and(|(key, _)| !saved.contains(key)) { self.play_updates.viewer_confirm = None; }
                         if let Some(editor) = &self.editor {
                             let key = account_key(&editor.account);
@@ -5925,6 +5941,7 @@ impl App {
                         if (self.editor.is_some() || settings.account_installs != self.settings.account_installs || settings.account_overlays != self.settings.account_overlays
                             || settings.account_auto_away != self.settings.account_auto_away || settings.account_auto_login != self.settings.account_auto_login || settings.selected_accounts != self.settings.selected_accounts
                             || settings.account_order != self.settings.account_order
+                            || settings.account_groups != self.settings.account_groups
                             || settings.account_pol_handles != self.settings.account_pol_handles
                             || settings.account_otp != self.settings.account_otp
                             || settings.account_no_otp != self.settings.account_no_otp) && !self.preview {
@@ -5968,9 +5985,12 @@ impl App {
                             }
                         }
                         if self.account_import.batch.is_some() { self.account_import.open = true; }
-                        self.status = t("Accounts saved.").into();
+                        self.status = match std::mem::take(&mut self.account_import.result) {
+                            result if result.is_empty() => t("Accounts saved.").into(),
+                            result => result,
+                        };
                     }
-                    Err(error) => self.status = error,
+                    Err(error) => { self.account_import.result.clear(); self.status = error; }
                 }
             }
             Message::ServicesLoaded(generation, lang, _) | Message::ServiceStatusLoaded(generation, lang, _)
@@ -6114,7 +6134,7 @@ impl App {
                 // XI_PREVIEW_DIR lets parallel worktrees keep their previews apart.
                 let dir = std::env::var_os("XI_PREVIEW_DIR")
                     .map(PathBuf::from)
-                    .unwrap_or_else(|| self.config.experiment.join("iced-launcher"));
+                    .unwrap_or_else(|| self.config.layout().previews());
                 let mut path = if self.page == Page::Settings {
                     dir.join(format!(
                         "preview-settings-{}{}.png",
@@ -6310,7 +6330,7 @@ fn initial_window_size() -> Size {
 /// The headline cache for `lang`: one file per language, so one language's
 /// headlines are never shown in the other.
 fn news_cache_path(config: &Config, lang: i18n::Lang) -> PathBuf {
-    services::cache_path(&config.experiment.join("iced-launcher/news-cache.json"), lang)
+    services::cache_path(&config.layout().news_cache(), lang)
 }
 /// The status line for a launch of `count` accounts through `tools` (none: the native client).
 fn launch_status(social_only: bool, all_native: bool, count: usize, tools: &[&str]) -> String {
@@ -6417,10 +6437,17 @@ fn startup_task_runner() -> impl FnMut(&[String]) -> Result<(bool, String), Stri
 /// auto-away, character select) and the Recovery choice. Every Play path takes its plan here
 /// (one Play, a batch, a relaunch, a pre-sign-in); a free function, as the batch path holds a row.
 fn play_plan(launch_tools: &launch_tools::State, settings: &Settings, features: &Option<features::Runtime>,
-    account: &Account) -> Option<pol_less::Plan> {
+    account: &Account, number: u32) -> Option<pol_less::Plan> {
     let mut plan = launch_tools.launch_plan(settings, account)?;
     plan.dismiss_disconnect = features::wiring::dismiss_disconnect(features);
+    plan.pad_hide = features::wiring::pad_hide(features);
+    plan.account_number = number;
     Some(plan)
+}
+
+/// `key`'s row on Home, 1-based (0 when it has none): the game log's anonymous name.
+fn account_number(accounts: &[AccountRow], key: &str) -> u32 {
+    accounts.iter().position(|row| row.key == key).map_or(0, |index| index as u32 + 1)
 }
 
 fn close_parks_later(workers: Vec<session_worker::ParkWorker>) {
@@ -6469,6 +6496,10 @@ fn main() {
         std::process::exit(code);
     }
     let preview = preview::flags().is_some();
+    // Files move into the current layout before anything reads them (storage::migrate).
+    if !preview {
+        storage::prepare_at_start();
+    }
     // Before the single-instance check, so its error box is in the user's language too.
     if !preview {
         let _ = load_settings_and_language(&Config::default());

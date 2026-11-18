@@ -15,7 +15,7 @@ use windows_sys::Win32::{
             GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible},
     },
 };
-use crate::{game_layout::{Input, Menus, Resolution}, log, proto::AutoLogin};
+use crate::{game_layout::{Input, Menus, Resolution}, key_log, log, proto::AutoLogin};
 
 const POLL: Duration = Duration::from_millis(100);
 const SETTLE: Duration = Duration::from_millis(250);
@@ -951,7 +951,7 @@ impl Worker {
                                 resolution.base, ready.2.entered(resolution.base));
                             login.replies = match &resolution.diagnostics {
                                 Ok(_) => true,
-                                Err(reason) => { log!("auto-login: gen={generation} still-logged-in retry unavailable ({reason})"); false }
+                                Err(reason) => { key_log!("auto-login: gen={generation} still-logged-in retry unavailable ({reason})"); false }
                             };
                             prepared = Some(ready);
                         }
@@ -964,7 +964,7 @@ impl Worker {
                 // carry the flag over: checked before every poll.
                 if let Err(reason) = world_clear(world.entered(layout.base)) {
                     match &login.retry {
-                        Some(retry) => log!("auto-login: gen={generation} {reason} after {} still-logged-in retries; input finished", retry.retries),
+                        Some(retry) => key_log!("auto-login: gen={generation} {reason} after {} still-logged-in retries; input finished", retry.retries),
                         None => log!("auto-login: gen={generation} {reason}; login input stopped for this game"),
                     }
                     return;
@@ -987,7 +987,7 @@ impl Worker {
                     }
                     Action::Refused => log!("auto-login: gen={generation} character still logged in; Enter follows once its dialog has held focus for {}s (screen={:?}, menu={}, lobby={lobby:?})",
                         DIALOG_SETTLE.as_secs(), current.screen, menu_name(&layout)),
-                    Action::Rearm => log!("auto-login: gen={generation} still-logged-in dialog closed; logging in again (menu={})", menu_name(&layout)),
+                    Action::Rearm => key_log!("auto-login: gen={generation} still-logged-in dialog closed; logging in again (menu={})", menu_name(&layout)),
                     Action::Tap(key) => {
                         let outcome = tap(window, game_thread, layout, keys, target, current, key, generation, world, &receiver);
                         if outcome != Tap::Skipped {
@@ -998,7 +998,7 @@ impl Worker {
                             Tap::Sent => match login.sent(current, key, started.elapsed()) {
                                 Sent::Key => {}
                                 // The menu is certain: the game thread re-read it before taking the key.
-                                Sent::Dismiss { retry, press, after } => log!("auto-login: gen={generation} character still logged in; retry {retry}/{MAX_RETRIES}: Enter {press}/{PRESSES} on menu={} {:.1}s after the first refusal",
+                                Sent::Dismiss { retry, press, after } => key_log!("auto-login: gen={generation} character still logged in; retry {retry}/{MAX_RETRIES}: Enter {press}/{PRESSES} on menu={} {:.1}s after the first refusal",
                                     printable(OK_MENU), after.as_secs_f32()),
                                 Sent::Confirmed { again: false } => log!("auto-login: gen={generation} login confirmation submitted; watching for a still-logged-in reply"),
                                 Sent::Confirmed { again: true } => log!("auto-login: gen={generation} login confirmation submitted again; watching the lobby reply"),
@@ -1014,8 +1014,8 @@ impl Worker {
             }
             match &login.retry {
                 None => log!("auto-login: gen={generation} timed out; finish login manually"),
-                Some(Retry { first: None, .. }) => log!("auto-login: gen={generation} no still-logged-in reply; input finished"),
-                Some(retry) => log!("auto-login: gen={generation} retry window ended after {} still-logged-in retries; finish login manually", retry.retries),
+                Some(Retry { first: None, .. }) => key_log!("auto-login: gen={generation} no still-logged-in reply; input finished"),
+                Some(retry) => key_log!("auto-login: gen={generation} retry window ended after {} still-logged-in retries; finish login manually", retry.retries),
             }
             drop(prepared);
         });
