@@ -210,6 +210,8 @@ pub(super) fn wire(ui: &MainWindow) {
     view.on_merge_sheet(|| send(Message::MergeAccount));
     view.on_sheet_edited(|i, value| { if let Some(field) = index(i).and_then(|i| FIELDS.get(i)) { send(Message::EditorChanged(*field, value.into())); } });
     view.on_sheet_folder_edited(|value| send(Message::AccountInstallChanged(value.into())));
+    view.on_sheet_windower_folder_edited(|value| send(Message::AccountWindowerChanged(value.into())));
+    view.on_browse_windower_folder(|| send(Message::Browse(crate::PickTarget::AccountWindowerFolder)));
     view.on_sheet_region(|i| { if (0..3).contains(&i) { send(Message::EditorRegion(i as u8)); } });
     view.on_sheet_launch(|i| { if let Some(value) = index(i).and_then(|i| EDITOR_LAUNCH.get(i)) { send(Message::EditorLaunchWith(*value)); } });
     view.on_sheet_flag(|i, on| act(|s| Some(match i {
@@ -1320,6 +1322,7 @@ fn sheet(view: &View, app: &App, state: &mut State) {
     put!(view, get_sheet_handles, set_sheet_handles, account.pol_handle_names.as_str().into());
     put!(view, get_sheet_totp_key, set_sheet_totp_key, account.totp_key.as_str().into());
     put!(view, get_sheet_folder, set_sheet_folder, editor.game_install.as_str().into());
+    put!(view, get_sheet_windower_folder, set_sheet_windower_folder, editor.windower_path.as_str().into());
 }
 
 #[cfg(test)]

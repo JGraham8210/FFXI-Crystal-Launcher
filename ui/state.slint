@@ -386,6 +386,7 @@ export global View {
     in-out property <string> sheet-handles;
     in-out property <string> sheet-totp-key;
     in-out property <string> sheet-folder;
+    in-out property <string> sheet-windower-folder;
     callback close-sheet();
     callback save-sheet();
     callback merge-sheet();
@@ -397,6 +398,8 @@ export global View {
     callback sheet-launch(int);
     /// crate::EditorFlag's order: uses OTP, sign in now, show ID, show password, change password,
     /// show authenticator key, change authenticator key.
+    callback sheet-windower-folder-edited(string);
+    callback browse-windower-folder();
     callback sheet-flag(int, bool);
     callback sheet-auto-login(bool);
     callback sheet-slot(int);

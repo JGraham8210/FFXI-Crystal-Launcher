@@ -225,6 +225,30 @@ export component AccountSheet inherits SideSheet {
                 }
                 Note { text: View.sheet.launch-hint; }
             }
+             if View.sheet.retail && View.sheet.tool == 2: Labelled {
+                caption: "Windower folder for this account";
+                HorizontalLayout {
+                    spacing: Theme.sp-s;
+                    Field {
+                        modal: true;
+                        label: "Windower folder for this account";
+                        placeholder: "Leave blank to use the default Windower folder";
+                        text <=> View.sheet-windower-folder;
+                        password: View.sheet.folder-masked;
+                        enabled: View.sheet.folder-enabled;
+                        edited(value) => { View.sheet-windower-folder-edited(value); }
+                    }
+                    IconButton {
+                        modal: true;
+                        label: "Choose this account's Windower folder";
+                        glyph: Glyph.folder;
+                        bordered: true;
+                        enabled: View.sheet.browse-enabled;
+                        clicked => { View.browse-windower-folder(); }
+                    }
+                }
+                Note { text: "Select this account's existing Windower installation. Its addons and settings stay in that folder."; }
+            }
             if View.sheet.retail && View.sheet.tool != 0: Labelled {
                 caption: View.sheet.tool-label;
                 Select {

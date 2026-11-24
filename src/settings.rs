@@ -51,6 +51,9 @@ pub(crate) struct Settings {
     /// Non-secret per-account installation overrides; the encrypted vault stays compatible.
     #[serde(default)]
     pub account_installs: HashMap<String, String>,
+    /// Local Windower installation per account; absent/empty uses the global folder.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub account_windower_paths: HashMap<String, String>,
     #[serde(default)]
     pub account_overlays: HashMap<String, Vec<String>>,
     /// Per-account PlayOnline Auto-Away minutes (0 = off); absent = 10.
@@ -146,6 +149,7 @@ impl Default for Settings {
             windower_profile: String::new(),
             loader_path: String::new(),
             account_installs: HashMap::new(),
+            account_windower_paths: HashMap::new(),
             account_overlays: HashMap::new(),
             account_auto_away: HashMap::new(),
             legacy_startup_signin: BTreeSet::new(),
@@ -233,6 +237,7 @@ impl Settings {
     pub(crate) fn plain_paths(&mut self) {
         for choice in self.account_auto_login.values_mut() { *choice = choice.normalized(); }
         for path in self.account_installs.values_mut() { *path = plain_text_path(path); }
+        for path in self.account_windower_paths.values_mut() { *path = plain_text_path(path); }
         for overlays in self.account_overlays.values_mut() { for path in overlays { *path = plain_text_path(path); } }
         for field in [
             &mut self.install_path,

@@ -214,6 +214,10 @@ impl Settings {
             LaunchWith::Windower => Tool::Windower,
         };
         let mut settings = self.tool_settings();
+        if let Some(path) = self.account_windower_paths.get(&crate::backend::account_key(account))
+            .filter(|path| !path.trim().is_empty()) {
+            settings.windower = path.trim().to_owned();
+        }
         if let Some(ini) = &account.ashita_boot_ini {
             settings.boot_ini = ini.clone();
         }

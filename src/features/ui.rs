@@ -183,7 +183,7 @@ pub(crate) struct State {
 }
 
 /// The detected Windower and Ashita folders.
-pub(crate) type ProfileDirs = (Option<PathBuf>, Option<PathBuf>);
+pub(crate) type ProfileDirs = (Option<PathBuf>, Option<PathBuf>, BTreeMap<String, String>);
 
 impl State {
     /// Marks the state changed.
@@ -344,7 +344,14 @@ impl App {
     /// just opened, or the detected tool folders changed while one shows. The host asks after
     /// each batch of messages; the files are read off the UI thread.
     pub(crate) fn feature_profiles_due(&mut self) -> Effect<Message> {
-        let dirs: ProfileDirs = (self.launch_tools.detected.windower.clone(), self.launch_tools.detected.ashita.clone());
+        let mut account_dirs: BTreeMap<String, String> = self.settings.account_windower_paths.iter()
+            .filter(|(_, path)| !path.trim().is_empty()).map(|(key, path)| (key.clone(), path.trim().to_owned())).collect();
+        if let Some(editor) = &self.editor {
+            let key = crate::backend::account_key(&editor.account);
+            if editor.windower_path.trim().is_empty() { account_dirs.remove(&key); }
+            else { account_dirs.insert(key, editor.windower_path.trim().to_owned()); }
+        }
+        let dirs: ProfileDirs = (self.launch_tools.detected.windower.clone(), self.launch_tools.detected.ashita.clone(), account_dirs);
         let open = self.features_view.open;
         let editor = self.editor.as_ref().map(|e| e.key.clone());
         if !open && editor.is_none() {

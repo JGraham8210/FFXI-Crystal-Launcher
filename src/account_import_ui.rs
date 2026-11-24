@@ -131,6 +131,7 @@ impl App {
                         .unwrap_or(crate::pol_less::AutoLogin { enabled: false, character_slot: draft.character_slot.unwrap_or(1) }).normalized();
                     self.editor = Some(Editor {
                         game_install: key.as_ref().and_then(|key| self.settings.account_installs.get(key)).cloned().unwrap_or_default(),
+                        windower_path: key.as_ref().and_then(|key| self.settings.account_windower_paths.get(key)).cloned().unwrap_or_default(),
                         dat_overlays: key.as_ref().and_then(|key| self.settings.account_overlays.get(key)).cloned().unwrap_or_default(),
                         flags: crate::EditorFlags {
                             uses_otp: key.as_ref().is_some_and(|key| self.settings.account_otp.contains(key)),
@@ -235,6 +236,7 @@ impl App {
         let settings = &self.settings;
         self.editor = Some(Editor {
             game_install: settings.account_installs.get(&key).cloned().unwrap_or_default(),
+            windower_path: settings.account_windower_paths.get(&key).cloned().unwrap_or_default(),
             dat_overlays: settings.account_overlays.get(&key).cloned().unwrap_or_default(),
             flags: crate::EditorFlags { uses_otp: settings.account_otp.contains(&key), ..Default::default() },
             auto_login: settings.account_auto_login.get(&key).copied().unwrap_or_default().normalized(),

@@ -606,6 +606,7 @@ fn accounts_print(app: &App) -> u64 {
         std::mem::discriminant(&account.mode).hash(&mut hash);
         account.launch_with.as_ref().map(std::mem::discriminant).hash(&mut hash);
         (&account.windower_profile, &account.ashita_boot_ini).hash(&mut hash);
+        app.settings.account_windower_paths.get(&row.key).hash(&mut hash);
     }
     std::mem::discriminant(&app.settings.launch_with).hash(&mut hash);
     (&app.settings.windower_profile, &app.settings.ashita_boot_ini).hash(&mut hash);

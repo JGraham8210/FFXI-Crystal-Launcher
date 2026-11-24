@@ -474,6 +474,7 @@ pub(crate) struct Editor {
     pub key: Option<String>,
     pub account: Account,
     pub game_install: String,
+    pub windower_path: String,
     pub dat_overlays: Vec<String>,
     pub auto_login: pol_less::AutoLogin,
     pub flags: EditorFlags,
@@ -515,6 +516,7 @@ impl Editor {
             key: None,
             account: blank_account(),
             game_install: String::new(),
+            windower_path: String::new(),
             dat_overlays: Vec::new(),
             auto_login: pol_less::AutoLogin::default(),
             flags: EditorFlags { sign_in_now: true, ..Default::default() },
@@ -782,6 +784,8 @@ pub(crate) enum Message {
     InstallationFound(u64, bool, Option<PathBuf>),
     InstallerPathChanged(String),
     AccountInstallChanged(String),
+    AccountWindowerChanged(String),
+    PickedAccountWindower(String, Option<PathBuf>),
     PickedAccountFolder(String, Option<PathBuf>),
     PickedAccountOverlay(String, Option<PathBuf>),
     SelectInstallerPath,
@@ -845,7 +849,7 @@ pub(crate) enum Message {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PickTarget {
     GameFolder,
-    AccountGameFolder,
+    AccountGameFolder,    
     AccountDatFolder,
     InstallerFolder,
     AshitaFolder,
@@ -854,6 +858,7 @@ pub(crate) enum PickTarget {
     LoaderFile,
     /// A file: the program at this index in Open with the game.
     ProgramFile(usize),
+    AccountWindowerFolder,
 }
 
 // Debug for logs and tests, but input messages can contain account passwords.
@@ -1433,17 +1438,20 @@ impl App {
         if self.preview || blocked {
             return Effect::none();
         }
-        if target == PickTarget::AccountGameFolder || target == PickTarget::AccountDatFolder {
+        if target == PickTarget::AccountGameFolder || target == PickTarget::AccountDatFolder || target == PickTarget::AccountWindowerFolder {
             let Some(editor) = &self.editor else { return Effect::none(); };
             if self.vault_saving { return Effect::none(); }
             if target == PickTarget::AccountDatFolder && editor.dat_overlays.len() >= 8 { return Effect::none(); }
             let current = if target == PickTarget::AccountDatFolder {
                 editor.dat_overlays.last().unwrap_or(&editor.game_install)
-            } else { &editor.game_install };
+            }
+            else if target == PickTarget::AccountWindowerFolder { &editor.windower_path }
+            else { &editor.game_install };
             let start = dialog_start(current, false);
             let key = account_key(&editor.account);
             return Effect::perform(pick_path(target, start), move |picked| {
                 if target == PickTarget::AccountDatFolder { Message::PickedAccountOverlay(key.clone(), picked) }
+                else if target == PickTarget::AccountWindowerFolder { Message::PickedAccountWindower(key.clone(), picked) }
                 else { Message::PickedAccountFolder(key.clone(), picked) }
             });
         }
@@ -1454,7 +1462,7 @@ impl App {
             PickTarget::WindowerFolder => &self.settings.windower_path,
             PickTarget::LoaderFile => &self.settings.loader_path,
             PickTarget::ProgramFile(i) => self.settings.open_with_game.get(i).map_or(&EMPTY, |p| &p.path),
-            PickTarget::AccountGameFolder | PickTarget::AccountDatFolder => unreachable!(),
+            PickTarget::AccountGameFolder | PickTarget::AccountDatFolder | PickTarget::AccountWindowerFolder => unreachable!(),
         };
         static EMPTY: String = String::new();
         let start = dialog_start(current, matches!(target, PickTarget::LoaderFile | PickTarget::ProgramFile(_)));
@@ -1488,7 +1496,7 @@ impl App {
             PickTarget::ProgramFile(i) => {
                 let _ = self.update(Message::OpenWithGame(open_with_game::Msg::Path(i, text)));
             }
-            PickTarget::AccountGameFolder | PickTarget::AccountDatFolder => {}
+            PickTarget::AccountGameFolder | PickTarget::AccountDatFolder | PickTarget::AccountWindowerFolder => {}
         }
         Effect::none()
     }
@@ -5178,7 +5186,8 @@ impl App {
                 // Let their native sign-out and final Windower save finish first.
                 self.close_parks_in_background(Some(pol_less::Tool::Windower.name()));
                 self.status = t("Edit profiles in Windower. Saved changes apply on the next fresh game launch.").into();
-                let preferred = self.settings.windower_path.clone();
+                let preferred = self.editor.as_ref().map(|editor| editor.windower_path.trim())
+                    .filter(|path| !path.is_empty()).unwrap_or(&self.settings.windower_path).to_owned();
                 let sessions = self.accounts.iter().filter_map(|row|
                     session_worker::find(&self.settings.config_for(&self.config, &row.account), &row.account)).collect();
                 let sender = self.sender.clone();
@@ -5416,6 +5425,7 @@ impl App {
                 {
                     self.editor = Some(Editor {
                         game_install: self.settings.account_installs.get(&key).cloned().unwrap_or_default(),
+                        windower_path: self.settings.account_windower_paths.get(&key).cloned().unwrap_or_default(),
                         dat_overlays: self.settings.account_overlays.get(&key).cloned().unwrap_or_default(),
                         auto_login: self.settings.account_auto_login.get(&key).copied().unwrap_or_default().normalized(),
                         flags: EditorFlags { uses_otp: self.settings.account_otp.contains(&key), ..Default::default() },
@@ -5484,6 +5494,7 @@ impl App {
                     }
                 }
                 if let Some(editor) = &self.editor {
+                    
                     if self.settings.launch_with_for(&editor.account) == crate::backend::LaunchWith::Native {
                         if editor.dat_overlays.len() > 8 { self.status = t("Choose at most eight DAT overlay folders.").into(); return Effect::none(); }
                         for path in &editor.dat_overlays {
@@ -5731,6 +5742,16 @@ impl App {
             Message::AccountInstallChanged(value) => {
                 if let Some(editor) = self.editor_mut() { editor.game_install = value; }
             }
+            Message::AccountWindowerChanged(value) => {
+                if let Some(editor) = self.editor_mut() { editor.windower_path = value; }
+            }
+            Message::PickedAccountWindower(key, picked) => {
+                if let Some(editor) = self.editor_mut() {
+                    if account_key(&editor.account) == key {
+                        if let Some(path) = picked { editor.windower_path = backend::plain_windows_path(&path).to_string_lossy().into_owned(); }
+                    }
+                }
+            }
             Message::PickedAccountFolder(key, picked) => {
                 if let Some(editor) = self.editor_mut() {
                     if account_key(&editor.account) == key {
@@ -5905,6 +5926,7 @@ impl App {
                             }
                         }
                         settings.account_installs.retain(|key, _| saved.contains(key));
+                        settings.account_windower_paths.retain(|key, _| saved.contains(key));
                         settings.account_overlays.retain(|key, _| saved.contains(key));
                         settings.account_auto_away.retain(|key, _| saved.contains(key));
                         settings.account_auto_login.retain(|key, _| saved.contains(key));
@@ -5919,6 +5941,9 @@ impl App {
                             let key = account_key(&editor.account);
                             if saved.contains(&key) {
                                 let path = editor.game_install.trim();
+                                let windower = editor.windower_path.trim();
+                                if windower.is_empty() { settings.account_windower_paths.remove(&key); }
+                                else { settings.account_windower_paths.insert(key.clone(), plain_text_path(windower)); }
                                 if path.is_empty() { settings.account_installs.remove(&key); }
                                 else { settings.account_installs.insert(key.clone(), plain_text_path(path)); }
                                 if editor.dat_overlays.is_empty() { settings.account_overlays.remove(&key); }
@@ -5938,7 +5963,7 @@ impl App {
                         }
                         // An edited account signs nothing back in by itself (a removed one has no row).
                         let edited: Vec<String> = self.editor.iter().flat_map(|editor| [Some(account_key(&editor.account)), editor.key.clone()]).flatten().collect();
-                        if (self.editor.is_some() || settings.account_installs != self.settings.account_installs || settings.account_overlays != self.settings.account_overlays
+                        if (self.editor.is_some() || settings.account_windower_paths != self.settings.account_windower_paths || settings.account_installs != self.settings.account_installs || settings.account_overlays != self.settings.account_overlays
                             || settings.account_auto_away != self.settings.account_auto_away || settings.account_auto_login != self.settings.account_auto_login || settings.selected_accounts != self.settings.selected_accounts
                             || settings.account_order != self.settings.account_order
                             || settings.account_groups != self.settings.account_groups

@@ -323,6 +323,7 @@ pub(super) fn boot(mut app: App) -> (App, Effect<Message>) {
             key: Some(app.accounts[0].key.clone()),
             account,
             game_install: String::new(),
+            windower_path: String::new(),
             dat_overlays: Vec::new(),
             auto_login: pol_less::AutoLogin { enabled: true, character_slot: 1 },
             flags: EditorFlags::default(),
